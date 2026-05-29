@@ -1,0 +1,7 @@
+nginx-ingress:
+  controller:
+    service:
+      type: NodePort
+    ingressClass:
+      name: nginx
+      setAsDefaultIngress: true
