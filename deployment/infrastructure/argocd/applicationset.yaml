@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: deployment-appset
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/\<your-org\>/\<your-repo\>
+        revision: main
+        directories:
+          - path: deployment/**
+  template:
+    metadata:
+      name: '{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/\<your-org\>/\<your-repo\>
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        server: https://kubernetes.default.svc
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

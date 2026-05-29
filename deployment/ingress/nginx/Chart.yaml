@@ -1,0 +1,9 @@
+apiVersion: v2
+name: nginx-ingress
+description: F5 NGINX Ingress Controller
+type: application
+version: 1.0.0
+dependencies:
+  - name: nginx-ingress
+    version: 2.5.3
+    repository: https://helm.nginx.com/stable
