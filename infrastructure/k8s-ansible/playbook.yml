@@ -165,3 +165,65 @@
         - name: Cluster init failed
           debug:
             msg: "Failed to initialize Kubernetes cluster"
+
+    # ── Cilium CNI ────────────────────────────────────────
+    - block:
+        - name: Download Cilium CLI
+          shell: |
+            curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
+            tar xzvf cilium-linux-amd64.tar.gz
+            mv cilium /usr/local/bin/
+            rm cilium-linux-amd64.tar.gz
+          args:
+            creates: /usr/local/bin/cilium
+
+        - name: Install Cilium
+          command: cilium install --version v1.19.4
+          environment:
+            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+          become: false
+          args:
+            creates: /etc/cni/net.d/05-cilium.conflist
+      rescue:
+        - name: Cilium install failed
+          debug:
+            msg: "Failed to install Cilium"
+
+    # ── ArgoCD ────────────────────────────────────────────
+    - block:
+        - name: Create argocd namespace
+          command: kubectl create namespace argocd
+          environment:
+            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+          become: false
+          register: argocd_ns
+          failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
+
+        - name: Install ArgoCD
+          command: >
+            kubectl apply -n argocd --server-side --force-conflicts
+            -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
+          environment:
+            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+          become: false
+      rescue:
+        - name: ArgoCD install failed
+          debug:
+            msg: "Failed to install ArgoCD"
+    
+    # ── Helm ──────────────────────────────────────────────
+    - block:
+        - name: Download Helm install script
+          get_url:
+            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            dest: /tmp/get-helm-3.sh
+            mode: '0755'
+
+        - name: Install Helm
+          command: /tmp/get-helm-3.sh
+          args:
+            creates: /usr/local/bin/helm
+      rescue:
+        - name: Helm install failed
+          debug:
+            msg: "Failed to install Helm"
