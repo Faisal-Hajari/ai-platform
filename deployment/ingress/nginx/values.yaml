@@ -5,3 +5,4 @@ nginx-ingress:
     ingressClass:
       name: nginx
       setAsDefaultIngress: true
+  namespaceOverride: nginx-ingress
