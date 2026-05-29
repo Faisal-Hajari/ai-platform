@@ -6,7 +6,7 @@ metadata:
 spec:
   generators:
     - git:
-        repoURL: https://github.com/\<your-org\>/\<your-repo\>
+        repoURL: git@github.com:Faisal-Hajari/ai-platform.git
         revision: main
         directories:
           - path: deployment/**
@@ -16,7 +16,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: https://github.com/\<your-org\>/\<your-repo\>
+        repoURL: git@github.com:Faisal-Hajari/ai-platform.git
         targetRevision: main
         path: '{{path}}'
       destination:
