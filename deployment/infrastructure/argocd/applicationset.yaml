@@ -9,9 +9,7 @@ spec:
         repoURL: git@github.com:Faisal-Hajari/ai-platform.git
         revision: main
         directories:
-          - path: deployment/**
-          - path: deployment/*
-            exclude: true
+          - path: deployment/*/*
   template:
     metadata:
       name: '{{path.basename}}'
