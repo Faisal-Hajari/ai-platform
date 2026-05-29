@@ -10,6 +10,8 @@ spec:
         revision: main
         directories:
           - path: deployment/**
+          - path: deployment/*
+            exclude: true
   template:
     metadata:
       name: '{{path.basename}}'
