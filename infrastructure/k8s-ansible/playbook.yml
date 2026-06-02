@@ -206,11 +206,23 @@
           environment:
             KUBECONFIG: /home/{{ ansible_user }}/.kube/config
           become: false
+
+        - name: Wait for ArgoCD to be ready
+          command: kubectl rollout status deployment/argocd-server -n argocd --timeout=120s
+          environment:
+            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+          become: false
+
+        - name: Apply ArgoCD ApplicationSet
+          command: kubectl apply -f {{ repo_path }}/infrastructure/k8s-ansible/argocd/applicationset.yaml
+          environment:
+            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+          become: false
       rescue:
         - name: ArgoCD install failed
           debug:
             msg: "Failed to install ArgoCD"
-    
+            
     # ── Helm ──────────────────────────────────────────────
     - block:
         - name: Download Helm install script
