@@ -20,7 +20,5 @@ extraObjects:
     metadata:
       name: local-l2-policy
     spec:
-      interfaces:
-        - eno1
       externalIPs: true
       loadBalancerIPs: true
