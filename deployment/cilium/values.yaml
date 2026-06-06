@@ -1,0 +1,8 @@
+cilium:
+  kubeProxyReplacement: true
+  l2announcements:
+    enabled: true
+  externalIPs:
+    enabled: true
+  loadBalancerIPs:
+    - cidr: "192.168.100.200/28"
