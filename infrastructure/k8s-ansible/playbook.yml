@@ -15,227 +15,214 @@
         replace: '#\1'
 
     # ── Kernel modules & sysctl ───────────────────────────
-    - block:
-        - name: Load kernel modules
-          modprobe:
-            name: "{{ item }}"
-            state: present
-          loop:
-            - overlay
-            - br_netfilter
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
 
-        - name: Persist kernel modules
-          copy:
-            dest: /etc/modules-load.d/k8s.conf
-            content: |
-              overlay
-              br_netfilter
+    - name: Persist kernel modules
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
 
-        - name: Set sysctl params
-          sysctl:
-            name: "{{ item.key }}"
-            value: "{{ item.value }}"
-            sysctl_file: /etc/sysctl.d/k8s.conf
-            reload: true
-          loop:
-            - { key: net.bridge.bridge-nf-call-iptables, value: "1" }
-            - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
-            - { key: net.ipv4.ip_forward, value: "1" }
-      rescue:
-        - name: Kernel module setup failed
-          debug:
-            msg: "Failed to configure kernel modules or sysctl"
+    - name: Set sysctl params
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: true
+      loop:
+        - { key: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        - { key: net.ipv4.ip_forward, value: "1" }
 
     # ── Containerd ────────────────────────────────────────
-    - block:
-        - name: Install containerd
-          apt:
-            name: containerd
-            state: present
-            update_cache: true
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+        update_cache: true
 
-        - name: Create containerd config directory
-          file:
-            path: /etc/containerd
-            state: directory
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
 
-        - name: Generate default containerd config
-          shell: containerd config default > /etc/containerd/config.toml
-          args:
-            creates: /etc/containerd/config.toml
+    - name: Generate default containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
 
-        - name: Enable SystemdCgroup in containerd config
-          replace:
-            path: /etc/containerd/config.toml
-            regexp: 'SystemdCgroup = false'
-            replace: 'SystemdCgroup = true'
+    - name: Enable SystemdCgroup in containerd config
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
 
-        - name: Enable CRI plugin in containerd config
-          replace:
-            path: /etc/containerd/config.toml
-            regexp: '^disabled_plugins = \["cri"\]'
-            replace: '#disabled_plugins = ["cri"]'
+    - name: Enable CRI plugin in containerd config
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '^disabled_plugins = \["cri"\]'
+        replace: '#disabled_plugins = ["cri"]'
 
-        - name: Enable and restart containerd
-          service:
-            name: containerd
-            state: restarted
-            enabled: true
-      rescue:
-        - name: Containerd setup failed
-          debug:
-            msg: "Failed to install or configure containerd"
+    - name: Enable and restart containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: true
 
     # ── kubeadm, kubelet, kubectl ─────────────────────────
-    - block:
-        - name: Install dependencies
-          apt:
-            name:
-              - apt-transport-https
-              - ca-certificates
-              - curl
-              - gpg
-            state: present
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
 
-        - name: Create keyrings directory
-          file:
-            path: /etc/apt/keyrings
-            state: directory
-            mode: '0755'
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-        - name: Add Kubernetes apt key
-          shell: |
-            curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
-            gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-          args:
-            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - name: Add Kubernetes apt key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-        - name: Add Kubernetes apt repository
-          copy:
-            dest: /etc/apt/sources.list.d/kubernetes.list
-            content: |
-              deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
+    - name: Add Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
 
-        - name: Install kubeadm kubelet kubectl
-          apt:
-            name:
-              - kubelet
-              - kubeadm
-              - kubectl
-            state: present
-            update_cache: true
+    - name: Install kubeadm kubelet kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: true
 
-        - name: Hold kubeadm kubelet kubectl at current version
-          dpkg_selections:
-            name: "{{ item }}"
-            selection: hold
-          loop:
-            - kubelet
-            - kubeadm
-            - kubectl
-      rescue:
-        - name: kubeadm install failed
-          debug:
-            msg: "Failed to install kubeadm kubelet or kubectl"
+    - name: Hold kubeadm kubelet kubectl at current version
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
 
     # ── Cluster init ──────────────────────────────────────
-    - block:
-        - name: Initialize Kubernetes cluster
-          command: kubeadm init --pod-network-cidr=192.168.0.0/16
-          args:
-            creates: /etc/kubernetes/admin.conf
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=10.0.0.0/8 --skip-phases=addon/kube-proxy
+      args:
+        creates: /etc/kubernetes/admin.conf
 
-        - name: Create .kube directory
-          file:
-            path: /home/{{ ansible_user }}/.kube
-            state: directory
-            owner: "{{ ansible_user }}"
-            group: "{{ ansible_user }}"
-            mode: '0755'
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
 
-        - name: Copy kubeconfig to user home
-          copy:
-            src: /etc/kubernetes/admin.conf
-            dest: /home/{{ ansible_user }}/.kube/config
-            remote_src: true
-            owner: "{{ ansible_user }}"
-            group: "{{ ansible_user }}"
-            mode: '0600'
-      rescue:
-        - name: Cluster init failed
-          debug:
-            msg: "Failed to initialize Kubernetes cluster"
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+    
+    # ── Remove control-plane taint ─────────────────────────── (You should not do this for serious clusters)
+    - name: Remove control-plane taint for single-node cluster
+      command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      failed_when: false
 
     # ── Cilium CNI ────────────────────────────────────────
-    - block:
-        - name: Download Cilium CLI
-          shell: |
-            curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
-            tar xzvf cilium-linux-amd64.tar.gz
-            mv cilium /usr/local/bin/
-            rm cilium-linux-amd64.tar.gz
-          args:
-            creates: /usr/local/bin/cilium
+    - name: Download and install Cilium CLI
+      shell: |
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      args:
+        creates: /usr/local/bin/cilium
 
-        - name: Install Cilium
-          command: cilium install --version v1.19.4
-          environment:
-            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
-          become: false
-          args:
-            creates: /etc/cni/net.d/05-cilium.conflist
-      rescue:
-        - name: Cilium install failed
-          debug:
-            msg: "Failed to install Cilium"
+    - name: Install or upgrade Cilium (bootstrap only)
+      shell: |
+        if cilium status --wait=false > /dev/null 2>&1; then
+          cilium upgrade --version v1.19.4 \
+            --set kubeProxyReplacement=true \
+            --set l2announcements.enabled=true \
+            --set externalIPs.enabled=true
+        else
+          cilium install --version v1.19.4 \
+            --set kubeProxyReplacement=true \
+            --set l2announcements.enabled=true \
+            --set externalIPs.enabled=true
+        fi
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      args:
+        creates: /etc/cni/net.d/05-cilium.conflist
 
     # ── ArgoCD ────────────────────────────────────────────
-    - block:
-        - name: Create argocd namespace
-          command: kubectl create namespace argocd
-          environment:
-            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
-          become: false
-          register: argocd_ns
-          failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
+    - name: Create argocd namespace
+      command: kubectl create namespace argocd
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      register: argocd_ns
+      failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
 
-        - name: Install ArgoCD
-          command: >
-            kubectl apply -n argocd --server-side --force-conflicts
-            -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
-          environment:
-            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
-          become: false
+    - name: Install ArgoCD
+      command: >
+        kubectl apply -n argocd --server-side --force-conflicts
+        -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
 
-        - name: Wait for ArgoCD to be ready
-          command: kubectl rollout status deployment/argocd-server -n argocd --timeout=120s
-          environment:
-            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
-          become: false
+    - name: Wait for ArgoCD to be ready
+      command: kubectl rollout status deployment/argocd-server -n argocd --timeout=120s
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
 
-        - name: Apply ArgoCD ApplicationSet
-          command: kubectl apply -f {{ repo_path }}/infrastructure/k8s-ansible/argocd/applicationset.yaml
-          environment:
-            KUBECONFIG: /home/{{ ansible_user }}/.kube/config
-          become: false
-      rescue:
-        - name: ArgoCD install failed
-          debug:
-            msg: "Failed to install ArgoCD"
-            
+    - name: Apply ArgoCD ApplicationSet
+      command: kubectl apply -f {{ repo_path }}/infrastructure/k8s-ansible/argocd/applicationset.yaml
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+
     # ── Helm ──────────────────────────────────────────────
-    - block:
-        - name: Download Helm install script
-          get_url:
-            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-            dest: /tmp/get-helm-3.sh
-            mode: '0755'
+    - name: Download Helm install script
+      get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get-helm-3.sh
+        mode: '0755'
 
-        - name: Install Helm
-          command: /tmp/get-helm-3.sh
-          args:
-            creates: /usr/local/bin/helm
-      rescue:
-        - name: Helm install failed
-          debug:
-            msg: "Failed to install Helm"
+    - name: Install Helm
+      command: /tmp/get-helm-3.sh
+      args:
+        creates: /usr/local/bin/helm
