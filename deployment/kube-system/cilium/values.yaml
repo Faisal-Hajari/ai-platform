@@ -6,19 +6,3 @@ cilium:
     enabled: true
   operator:
     replicas: 1
-
-extraObjects:
-  - apiVersion: cilium.io/v2alpha1
-    kind: CiliumLoadBalancerIPPool
-    metadata:
-      name: local-pool
-    spec:
-      blocks:
-        - cidr: "192.168.100.200/28"
-  - apiVersion: cilium.io/v2alpha1
-    kind: CiliumL2AnnouncementPolicy
-    metadata:
-      name: local-l2-policy
-    spec:
-      externalIPs: true
-      loadBalancerIPs: true
