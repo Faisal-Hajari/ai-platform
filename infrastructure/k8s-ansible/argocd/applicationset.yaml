@@ -19,7 +19,14 @@ spec:
           - path: deployment/*/*
   template:
     metadata:
-      name: '{{path.basename}}'
+      # Namespace-qualified, not the bare leaf directory. The generator walks
+      # deployment/<namespace>/<chart>, so the leaf name is only unique within its
+      # namespace: deployment/ingress/nginx and deployment/ai-services/nginx would both
+      # render an Application called nginx. That is one Application written twice, with
+      # the two definitions overwriting each other's destination namespace and source
+      # path on every reconcile -- and with prune on, alternately creating and deleting
+      # the same resources in two namespaces.
+      name: '{{path[1]}}-{{path.basename}}'
     spec:
       project: default
       source:
