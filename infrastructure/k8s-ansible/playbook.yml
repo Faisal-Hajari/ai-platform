@@ -269,6 +269,82 @@
         - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
         - { key: net.ipv4.ip_forward, value: "1" }
 
+    # ── apt sources ───────────────────────────────────────
+    # This block sits ahead of `Install containerd` deliberately, and the ordering is the
+    # fix for a failure that takes the whole play down. `Install containerd` carries
+    # `update_cache: true`, and an apt refresh validates EVERY configured repository --
+    # including the Kubernetes one this play adds itself. So while the key and the repo
+    # were configured further down, any run on a machine that already had
+    # /etc/apt/sources.list.d/kubernetes.list from a previous run refreshed the cache
+    # against that repo before reaching the tasks that could repair it. A play that
+    # cannot fix the source it broke is a play that needs a human with a chmod.
+    #
+    # Configuring every apt source before the first `update_cache` closes that: the
+    # keyring is written and made readable, and only then does anything refresh.
+    # Deliberately NO update_cache, and this is the whole ordering constraint in one task.
+    # The play's FIRST apt refresh must come after the keyring below is readable, because
+    # a refresh validates every configured repository and `kubernetes.list` may already be
+    # on disk from an earlier run pointing at a 0600 key. Putting `update_cache: true`
+    # here was tried and simply moved the same failure one task earlier: `Install
+    # dependencies` refreshed, the Kubernetes repo failed to verify, and the run died
+    # three tasks before the chmod that would have fixed it.
+    #
+    # Safe without a refresh: all four are present on a default Ubuntu install, so this is
+    # normally a no-op, and where it is not, apt resolves them from the existing lists.
+    # The first real refresh is `Install containerd` below, by which point the keyring is
+    # readable and the repo verifies.
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes apt key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    # `gpg --dearmor -o` writes with gpg's own restrictive umask, so the keyring lands
+    # 0600 root:root. The `file:` task above sets 0755 on the *directory*; nothing set a
+    # mode on the key itself. apt runs gpgv as the unprivileged `_apt` user, which then
+    # cannot read it, and every fetch from this repo fails as unsigned:
+    #
+    #   W: The key(s) in the keyring /etc/apt/keyrings/kubernetes-apt-keyring.gpg are
+    #      ignored as the file is not readable by user executing gpgv.
+    #   W: ... NO_PUBKEY 234654DA9A296436
+    #   E: The repository '.../v1.36/deb  InRelease' is not signed.
+    #
+    # ("unsupported filetype" rides along in the same message -- apt cannot identify a
+    # file it cannot open, so it is a symptom of the permissions, not a second fault.)
+    #
+    # This never fired before because the `creates:` guard above skips key generation
+    # entirely once the file exists, and on this node it already existed from a hand-run
+    # of the upstream install instructions -- which do carry the `chmod 644` this task
+    # replaces. The bug was therefore invisible for as long as nobody built from a
+    # genuinely empty machine. Separate task rather than a chmod in the shell above, so
+    # it also repairs a key that is already there with the wrong mode.
+    - name: Make the Kubernetes apt key readable by _apt
+      file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        mode: '0644'
+
+    - name: Add Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
+
     # ── Containerd ────────────────────────────────────────
     - name: Install containerd
       apt:
@@ -378,34 +454,8 @@
       meta: flush_handlers
 
     # ── kubeadm, kubelet, kubectl ─────────────────────────
-    - name: Install dependencies
-      apt:
-        name:
-          - apt-transport-https
-          - ca-certificates
-          - curl
-          - gpg
-        state: present
-
-    - name: Create keyrings directory
-      file:
-        path: /etc/apt/keyrings
-        state: directory
-        mode: '0755'
-
-    - name: Add Kubernetes apt key
-      shell: |
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
-        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      args:
-        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-
-    - name: Add Kubernetes apt repository
-      copy:
-        dest: /etc/apt/sources.list.d/kubernetes.list
-        content: |
-          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
-
+    # The apt source these come from is configured in the "apt sources" block above,
+    # ahead of the first cache refresh -- see the reasoning there.
     - name: Install kubeadm kubelet kubectl
       apt:
         name:
