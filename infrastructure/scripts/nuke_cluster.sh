@@ -8,12 +8,14 @@ kubeadm reset -f
 
 rm -rf /etc/cni/net.d
 rm -rf /etc/kubernetes
-# Run as root via sudo, so ~ is /root -- resolve the invoking user's real home
-# instead, otherwise their kubeconfig survives the nuke with credentials for a
-# cluster that no longer exists.
+# Run as root via sudo, so ~ is /root -- that misses the invoking user's config,
+# the one the playbook installs. Both are stale after a nuke: root's if the
+# operator did the kubeadm post-init copy so `sudo kubectl` works, the user's
+# from playbook.yml. Drop both, otherwise a rebuild yields x509 errors against
+# the new CA that look unrelated to the reset.
 NUKE_USER=${SUDO_USER:-$USER}
 NUKE_HOME=$(getent passwd "$NUKE_USER" | cut -d: -f6)
-rm -rf "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
+rm -rf /root/.kube "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
 
 systemctl restart containerd
 
