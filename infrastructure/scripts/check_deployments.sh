@@ -17,9 +17,10 @@ fail=0
 
 for chart in deployment/*/*/Chart.yaml; do
   dir=$(dirname "$chart")
-  # Per-chart, so one bad chart does not mask the checks on the ones after it. The
-  # loop body must also not END on a failed test: under `set -e` that would exit the
-  # shell mid-loop and leave the remaining charts unrendered.
+  # Per-chart. `fail` used to be the only flag and was never reset, so once any chart
+  # failed, every chart after it stopped printing `ok` and read as though it had failed
+  # too. (It did not abort the run: the trailing `[ "$fail" -eq 0 ] && echo` sits before
+  # the final `&&` of an AND-list, which is one of the cases `set -e` exempts.)
   chart_fail=0
   echo "==> $dir"
   helm dependency update "$dir" >/dev/null
@@ -71,35 +72,74 @@ done
 # room, so the condition just persists. Both halves are static YAML, so assert
 # containment here instead of learning it from the cluster (#26).
 echo "==> deployment/kube-system/cilium-config"
-if pool_errors=$(python3 - <<'PY'
+if pool_errors=$(python3 - 2>&1 <<'PY'
 import ipaddress, pathlib, sys, yaml
 
 values = pathlib.Path("deployment/kube-system/cilium/values.yaml")
 pool_dir = pathlib.Path("deployment/kube-system/cilium-config")
 
-def contains(block, ip):
+errors = []
+blocks = []   # (label, first, last) for every block that could serve the ingress
+skipped = []  # pools deliberately not counted, and why
+
+def parse_block(name, block):
+    """(label, first address, last address), or ValueError if the block is malformed."""
     if "cidr" in block:
         # strict=False because that is what LB-IPAM does: it normalizes a host address
         # to its network, so a block written "192.168.100.200/28" really offers
         # .192-.207 (#8). Checking the literal string instead would call a pin inside
         # the pool when it is only inside the range someone meant to write.
-        return ip in ipaddress.ip_network(block["cidr"], strict=False)
-    return ipaddress.ip_address(block["start"]) <= ip <= ipaddress.ip_address(block["stop"])
+        net = ipaddress.ip_network(block["cidr"], strict=False)
+        return f"{name}: {block['cidr']}", net[0], net[-1]
+    first, last = ipaddress.ip_address(block["start"]), ipaddress.ip_address(block["stop"])
+    if last < first:
+        raise ValueError(f"stop {last} precedes start {first}")
+    return f"{name}: {first}-{last}", first, last
 
-blocks = []
-for path in sorted(pool_dir.glob("*.yaml")):
-    for doc in yaml.safe_load_all(path.read_text()):
-        if isinstance(doc, dict) and doc.get("kind") == "CiliumLoadBalancerIPPool":
-            name = (doc.get("metadata") or {}).get("name", path.name)
-            blocks += [(name, b) for b in ((doc.get("spec") or {}).get("blocks") or [])]
+# *.y*ml, not *.yaml: ArgoCD's directory sync applies both spellings, and reading only
+# half the pools would let a pin look homeless when it is not, or vice versa.
+for path in sorted(pool_dir.glob("*.y*ml")):
+    try:
+        docs = list(yaml.safe_load_all(path.read_text()))
+    except (OSError, yaml.YAMLError) as exc:
+        errors.append(f"{path} could not be read: {exc}")
+        continue
+    for doc in docs:
+        if not isinstance(doc, dict) or doc.get("kind") != "CiliumLoadBalancerIPPool":
+            continue
+        name = (doc.get("metadata") or {}).get("name") or path.name
+        spec = doc.get("spec") or {}
+        # A pool that cannot hand this service an address is not containment, however
+        # well its blocks cover the pin. spec.disabled takes the whole pool out of
+        # service; spec.serviceSelector narrows it to services it matches, and the
+        # ingress service's labels are the upstream chart's to set, not this repo's --
+        # so rather than guess at a match, refuse to count the pool and name it in the
+        # failure. Both directions stay closed: an unservable pool cannot satisfy the
+        # check, and an operator who meant it to serve the ingress is told why it did
+        # not count.
+        if spec.get("disabled"):
+            skipped.append(f"{name} (disabled)")
+            continue
+        if spec.get("serviceSelector"):
+            skipped.append(f"{name} (serviceSelector, not evaluated)")
+            continue
+        for index, block in enumerate(spec.get("blocks") or []):
+            try:
+                blocks.append(parse_block(name, block))
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{name} block {index} is malformed ({exc}): {block!r}")
 
-service = (((yaml.safe_load(values.read_text()) or {}).get("cilium") or {})
-           .get("ingressController") or {}).get("service") or {}
-pin = (service.get("annotations") or {}).get("lbipam.cilium.io/ips")
+try:
+    service = (((yaml.safe_load(values.read_text()) or {}).get("cilium") or {})
+               .get("ingressController") or {}).get("service") or {}
+    pin = (service.get("annotations") or {}).get("lbipam.cilium.io/ips")
+except (OSError, yaml.YAMLError, AttributeError) as exc:
+    errors.append(f"{values} could not be read: {exc}")
+    pin = None
 
-errors = []
 if not blocks:
-    errors.append(f"no CiliumLoadBalancerIPPool blocks found under {pool_dir}")
+    detail = f" (skipped {', '.join(skipped)})" if skipped else ""
+    errors.append(f"no usable CiliumLoadBalancerIPPool block found under {pool_dir}{detail}")
 if not pin:
     # Not merely cosmetic, and not a vacuous pass to skip over: unpinned, the shared
     # entrypoint takes whatever LB-IPAM hands out and the ingress A records rot. A
@@ -110,13 +150,19 @@ for text in (pin or "").split(","):
     text = text.strip()
     if not text:
         continue
-    ip = ipaddress.ip_address(text)
-    if not any(contains(b, ip) for _, b in blocks):
-        spelled = ", ".join(
-            f"{n}: {b['cidr']}" if "cidr" in b else f"{n}: {b['start']}-{b['stop']}"
-            for n, b in blocks
-        )
-        errors.append(f"ingress pin {ip} is outside every pool block ({spelled})")
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        errors.append(f"lbipam.cilium.io/ips value {text!r} is not an IP address"
+                      " -- the annotation takes bare addresses, not CIDRs")
+        continue
+    # `blocks` empty is already its own failure above -- saying the pin is outside a
+    # pool that does not exist on top of it just buries the reason.
+    if blocks and not any(first.version == ip.version and first <= ip <= last for _, first, last in blocks):
+        detail = f"; skipped {', '.join(skipped)}" if skipped else ""
+        spelled = ", ".join(label for label, _, _ in blocks) or "none"
+        errors.append(f"ingress pin {ip} is outside every pool block that can serve it"
+                      f" ({spelled}){detail}")
 
 print("\n".join(errors))
 sys.exit(1 if errors else 0)
@@ -124,6 +170,8 @@ PY
 ); then
   echo "    ok"
 else
+  # 2>&1 above, so an exception this block does not anticipate arrives here as its
+  # traceback rather than as a blank FAIL with the reason on an uncaptured stderr.
   while IFS= read -r line; do
     echo "    FAIL: $line"
   done <<<"$pool_errors"

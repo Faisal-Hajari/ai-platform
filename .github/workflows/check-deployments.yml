@@ -1,0 +1,67 @@
+# ArgoCD's ApplicationSet syncs deployment/ straight from main with an automated,
+# selfHeal policy: whatever merges here is on the cluster within minutes, with no
+# staging step in between. check_deployments.sh is the only thing that inspects these
+# files before that happens, and its header rightly says "run before pushing" -- which
+# is advice, not a guarantee. This runs it on the changes themselves, so the invariants
+# it asserts (#26) hold for anything that reaches main.
+name: check deployments
+
+on:
+  pull_request:
+    paths:
+      - 'deployment/**'
+      - 'infrastructure/scripts/check_deployments.sh'
+      - 'infrastructure/k8s-ansible/playbook.yml'
+      - '.github/workflows/check-deployments.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deployment/**'
+      - 'infrastructure/scripts/check_deployments.sh'
+      - 'infrastructure/k8s-ansible/playbook.yml'
+      - '.github/workflows/check-deployments.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party-to-this-repo code, pinned by commit rather than by tag: a tag is
+      # mutable and would let the action change under us, which is the same objection
+      # that got get-helm-3 replaced by a checksummed release tarball (#31).
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # The playbook already pins Helm and carries its checksum, and that pin is what
+      # runs against the real cluster. Reading it back out here rather than restating
+      # it keeps CI rendering with the same Helm the cluster was built with, and leaves
+      # one place to bump.
+      - name: Install the Helm the playbook pins
+        run: |
+          set -euo pipefail
+          eval "$(python3 - <<'PY'
+          import shlex, yaml
+          v = yaml.safe_load(open("infrastructure/k8s-ansible/playbook.yml"))[0]["vars"]
+          print("version=" + shlex.quote(v["helm_version"]))
+          print("sha256=" + shlex.quote(v["helm_sha256"]["amd64"]))
+          PY
+          )"
+          echo "installing helm $version"
+          curl -fsSL -o helm.tar.gz "https://get.helm.sh/helm-$version-linux-amd64.tar.gz"
+          echo "$sha256  helm.tar.gz" | sha256sum --check --strict -
+          tar -xzf helm.tar.gz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          rm -rf helm.tar.gz linux-amd64
+
+      - name: Check deployments
+        run: bash infrastructure/scripts/check_deployments.sh
