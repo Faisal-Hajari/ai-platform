@@ -10,6 +10,19 @@ System for serving AI models over k8s
   `infrastructure/k8s-ansible/argocd/applicationset.yaml` picks them up from here.
 - `infrastructure/scripts/` — operational scripts, described below.
 
+### Application names
+
+The generated Applications are named `<namespace>-<chart>` — the directory
+`deployment/kube-system/cilium` becomes the Application `kube-system-cilium`. The leaf
+directory alone is not unique: it is only namespaced by the directory above it, so
+`deployment/ingress/nginx` and `deployment/ai-services/nginx` would name the same
+Application twice and each reconcile would overwrite the other's namespace and path.
+
+Renaming is safe on a running cluster. The ApplicationSet deletes the Applications that
+carry the old names, but the template sets no `resources-finalizer`, so that delete does
+not cascade to the workloads; the new Applications sync the same paths and adopt the
+resources that are already there.
+
 ## Bootstrap
 
 ```bash
