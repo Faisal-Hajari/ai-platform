@@ -304,12 +304,25 @@
         mode: '0600'
     
     # ── Remove control-plane taint ─────────────────────────── (You should not do this for serious clusters)
+    # `kubectl taint ...-` exits non-zero with `taint "..." not found` once the taint is
+    # already gone, and that re-run case is the only failure worth tolerating here.
+    # `failed_when: false` tolerated it by tolerating everything else too: an API server
+    # not up yet, a kubeconfig that was never copied, an RBAC denial, a node that has not
+    # registered. On a single-node cluster this taint is what makes the node schedulable
+    # at all, so a swallowed failure ends the run green over a cluster where ArgoCD and
+    # every workload after it sit Pending -- and it reads as a scheduling problem rather
+    # than as a bootstrap step that never happened. Match the one expected message
+    # instead, so every other way this can fail still fails the run.
     - name: Remove control-plane taint for single-node cluster
       command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
-      failed_when: false
+      register: untaint
+      changed_when: "'untainted' in untaint.stdout"
+      failed_when: >-
+        untaint.rc != 0 and
+        'taint "node-role.kubernetes.io/control-plane" not found' not in untaint.stderr
 
     # ── Cilium CNI ────────────────────────────────────────
     # A missing key leaves this undefined rather than raising, so the assert below can
