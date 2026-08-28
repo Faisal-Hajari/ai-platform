@@ -53,28 +53,62 @@
         path: /etc/containerd
         state: directory
 
+    # kubelet is configured for the systemd cgroup driver, so containerd has to use it
+    # too; a mismatch leaves both managing the same cgroups and the node gets unstable
+    # under memory pressure. Only `containerd config default` emits a CRI runtime section
+    # with a SystemdCgroup key to flip -- the Ubuntu package ships a commented stub that
+    # has no such key. Guarding generation on `creates:` therefore left the stub in place,
+    # and the replace below then matched nothing and reported ok: a green run over a node
+    # that never got the setting. Guard on the content we need instead of the file's
+    # existence, and assert afterwards so a future silent no-op fails loudly.
+    - name: Read the current containerd config
+      slurp:
+        path: /etc/containerd/config.toml
+      register: containerd_config
+      failed_when: false
+
     - name: Generate default containerd config
       shell: containerd config default > /etc/containerd/config.toml
-      args:
-        creates: /etc/containerd/config.toml
+      when: "'SystemdCgroup' not in (containerd_config.content | default('') | b64decode)"
+      notify: restart containerd
 
     - name: Enable SystemdCgroup in containerd config
       replace:
         path: /etc/containerd/config.toml
         regexp: 'SystemdCgroup = false'
         replace: 'SystemdCgroup = true'
+      notify: restart containerd
 
     - name: Enable CRI plugin in containerd config
       replace:
         path: /etc/containerd/config.toml
         regexp: '^disabled_plugins = \["cri"\]'
         replace: '#disabled_plugins = ["cri"]'
+      notify: restart containerd
 
-    - name: Enable and restart containerd
+    - name: Re-read the containerd config
+      slurp:
+        path: /etc/containerd/config.toml
+      register: containerd_config_final
+
+    - name: Assert containerd is set to the systemd cgroup driver
+      assert:
+        that: "'SystemdCgroup = true' in (containerd_config_final.content | b64decode)"
+        fail_msg: >-
+          /etc/containerd/config.toml has no `SystemdCgroup = true`, so containerd would
+          run with cgroupfs while kubelet uses systemd.
+        success_msg: containerd is set to the systemd cgroup driver
+
+    - name: Enable containerd
       service:
         name: containerd
-        state: restarted
+        state: started
         enabled: true
+
+    # kubeadm init below talks to containerd, so a pending config change has to be applied
+    # now rather than at the end of the play.
+    - name: Restart containerd now if its config changed
+      meta: flush_handlers
 
     # ── kubeadm, kubelet, kubectl ─────────────────────────
     - name: Install dependencies
@@ -299,3 +333,9 @@
       command: /tmp/get-helm-3.sh
       args:
         creates: /usr/local/bin/helm
+
+  handlers:
+    - name: restart containerd
+      service:
+        name: containerd
+        state: restarted
