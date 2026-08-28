@@ -173,12 +173,20 @@
           cilium upgrade --version v1.19.4 \
             --set kubeProxyReplacement=true \
             --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true
+            --set externalIPs.enabled=true \
+            --set ingressController.enabled=true \
+            --set ingressController.default=true \
+            --set ingressController.loadbalancerMode=shared \
+            --set ingressController.service.loadBalancerIP={{ ingress_lb_ip }}
         else
           cilium install --version v1.19.4 \
             --set kubeProxyReplacement=true \
             --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true
+            --set externalIPs.enabled=true \
+            --set ingressController.enabled=true \
+            --set ingressController.default=true \
+            --set ingressController.loadbalancerMode=shared \
+            --set ingressController.service.loadBalancerIP={{ ingress_lb_ip }}
         fi
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
