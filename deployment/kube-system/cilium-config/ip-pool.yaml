@@ -18,5 +18,8 @@ spec:
     #
     # .200 is the address ../cilium/values.yaml pins for kube-system/cilium-ingress
     # via lbipam.cilium.io/ips -- keep the two in step.
+    # infrastructure/scripts/check_deployments.sh asserts that containment, including
+    # the CIDR normalization above, so a drifting pin fails before it reaches the
+    # cluster and wedges every Ingress on IPAMRequestSatisfied=False.
     - start: "192.168.100.200"
       stop: "192.168.100.215"

@@ -66,6 +66,7 @@ cilium:
         # Pin the shared entrypoint so ingress hostnames have a stable A record.
         # ../cilium-config/ip-pool.yaml names this range explicitly, so .200 is an
         # address that file spells out rather than one it happens to cover -- keep the
-        # two in step. LB-IPAM's own annotation, rather than spec.loadBalancerIP,
-        # which k8s deprecated in 1.24.
+        # two in step; infrastructure/scripts/check_deployments.sh fails if they drift.
+        # LB-IPAM's own annotation, rather than spec.loadBalancerIP, which k8s
+        # deprecated in 1.24.
         lbipam.cilium.io/ips: "192.168.100.200"
