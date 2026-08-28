@@ -167,18 +167,37 @@
       args:
         creates: /usr/local/bin/cilium
 
+    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
+    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
+    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
+    - name: Read the ArgoCD-managed Cilium values
+      set_fact:
+        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
+
+    - name: Resolve the pinned Cilium Ingress address
+      set_fact:
+        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
+
     - name: Install or upgrade Cilium (bootstrap only)
       shell: |
         if cilium status --wait=false > /dev/null 2>&1; then
           cilium upgrade --version v1.19.4 \
             --set kubeProxyReplacement=true \
             --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true
+            --set externalIPs.enabled=true \
+            --set ingressController.enabled=true \
+            --set ingressController.default=true \
+            --set ingressController.loadbalancerMode=shared \
+            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}'
         else
           cilium install --version v1.19.4 \
             --set kubeProxyReplacement=true \
             --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true
+            --set externalIPs.enabled=true \
+            --set ingressController.enabled=true \
+            --set ingressController.default=true \
+            --set ingressController.loadbalancerMode=shared \
+            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}'
         fi
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config

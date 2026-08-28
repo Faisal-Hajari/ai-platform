@@ -1,7 +1,20 @@
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: local-pool
 spec:
   blocks:
-    - cidr: "192.168.100.200/28"
+    # Written as start/stop, not a CIDR. "192.168.100.200/28" was not on a /28
+    # boundary, so LB-IPAM normalized it to 192.168.100.192/28 -- the range did not
+    # mean what it read, and .200 sat inside it only by that accident.
+    #
+    # These bounds are that same real range, stated outright. Deliberately NOT
+    # .200-.215, which is what the old CIDR looked like it meant: default/test-nginx
+    # holds .192, and moving the floor to .200 would push it out of the pool, so
+    # LB-IPAM would release and reallocate it lowest-free -- landing it on the .200
+    # that ../cilium/values.yaml pins for the ingress. The two live in different
+    # ArgoCD Applications (cilium-config and cilium) with no ordering guarantee, so
+    # that race would strand cilium-ingress with IPAMRequestSatisfied: False and no
+    # self-healing, since LB-IPAM will not evict an existing holder.
+    - start: "192.168.100.192"
+      stop: "192.168.100.207"
