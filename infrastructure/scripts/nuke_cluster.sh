@@ -15,7 +15,8 @@ rm -rf /etc/kubernetes
 # the new CA that look unrelated to the reset.
 NUKE_USER=${SUDO_USER:-$USER}
 NUKE_HOME=$(getent passwd "$NUKE_USER" | cut -d: -f6)
-rm -rf /root/.kube "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
+rm -rf /root/.kube
+rm -rf "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
 
 systemctl restart containerd
 
