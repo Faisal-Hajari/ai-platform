@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Renders every chart under deployment/ the way ArgoCD will and asserts the
-# invariants that have bitten this cluster before. Run before pushing changes
-# to deployment/ -- a bad value here is accepted silently and only shows up
-# later as a CrashLoop.
+# Renders every chart in this repo the way its deployer will and asserts the invariants
+# that have bitten this cluster before. Run before pushing changes to either half -- a
+# bad value here is accepted silently and only shows up later as a CrashLoop.
+#
+# Two halves, rendered identically because `helm template` is what both deployers do:
+# infrastructure/k8s-ansible/system-apps/*/ is applied by the Ansible play (see
+# system-apps/README.md), and deployment/*/*/ is synced by ArgoCD. deployment/ is empty
+# today and that is not a failure -- the charts array below simply has one entry.
 #
 # Note that `helm dependency update` writes into the chart's charts/ directory and
 # never prunes it. charts/ and Chart.lock are gitignored, so a stale copy left over
@@ -22,16 +26,20 @@ fail=0
 ingress_render=$(mktemp)
 trap 'rm -f "$ingress_render"' EXIT
 
+cilium_dir=infrastructure/k8s-ansible/system-apps/cilium
+
 # Without nullglob an empty deployment/ hands the unexpanded pattern to helm, and the
 # run ends on helm's complaint about a directory named `*` -- an error that says nothing
-# about the invariants that went unchecked.
+# about the invariants that went unchecked. Both patterns are globs for that reason,
+# including the system-apps one, which today matches only $cilium_dir: a chart that has
+# gone missing should reach the cross-file check below, which says what it was needed
+# for, rather than take the run down on a helm error first.
+#
+# There is no "no charts found" failure any more either. deployment/ matching nothing is
+# the normal state now that the CNI has moved out of it, and it stops being a failure
+# the moment it would fire on every run.
 shopt -s nullglob
-charts=(deployment/*/*/Chart.yaml)
-if [ "${#charts[@]}" -eq 0 ]; then
-  echo "==> deployment"
-  echo "    FAIL: no charts found -- deployment/*/*/Chart.yaml matched nothing"
-  fail=1
-fi
+charts=(infrastructure/k8s-ansible/system-apps/*/Chart.yaml deployment/*/*/Chart.yaml)
 
 for chart in "${charts[@]}"; do
   dir=$(dirname "$chart")
@@ -64,7 +72,10 @@ PY
   # ClusterIP that only it can program. Without k8sServiceHost the chart omits
   # KUBERNETES_SERVICE_HOST and Cilium deadlocks against 10.96.0.1 on restart,
   # taking every other pod down with it.
-  if [ "$(basename "$dir")" = "cilium" ]; then
+  # Matched on the whole path, not the basename: a future deployment/<ns>/cilium is a
+  # different chart, and letting it overwrite this render would check the pool against
+  # the wrong one.
+  if [ "$dir" = "$cilium_dir" ]; then
     if ! grep -q KUBERNETES_SERVICE_HOST <<<"$render"; then
       echo "    FAIL: no KUBERNETES_SERVICE_HOST in the render -- set cilium.k8sServiceHost"
       chart_fail=1
@@ -79,23 +90,25 @@ PY
   fi
 done
 
-# cilium-config/ is plain manifests with no Chart.yaml, so the loop above never looks
-# at it -- and the invariant that matters most spans it and the chart. The shared
-# ingress entrypoint is pinned in cilium/values.yaml; the pool that address has to come
-# out of is declared here. They are two ArgoCD Applications with no ordering between
-# their syncs, so they can disagree transiently even when each file is right on its own.
+# config/ is plain manifests with no Chart.yaml, so the loop above never looks at it --
+# and the invariant that matters most spans it and the chart. The shared ingress
+# entrypoint is pinned in cilium/values.yaml; the pool that address has to come out of
+# is declared here. The playbook applies the two in one step now, so they can no longer
+# disagree merely because two Applications synced in an arbitrary order -- but nothing
+# stops one file being edited without the other, which is what this asserts.
 #
 # When the pin lands outside the pool, LB-IPAM sets IPAMRequestSatisfied=False on
 # kube-system/cilium-ingress, the service never gets an address, and every Ingress in
 # the cluster is dead. It does not self-heal: LB-IPAM will not evict a holder to make
 # room, so the condition just persists. Both halves are static YAML, so assert
 # containment here instead of learning it from the cluster (#26).
-echo "==> deployment/kube-system/cilium-config"
-if pool_errors=$(INGRESS_RENDER="$ingress_render" python3 - 2>&1 <<'PY'
+echo "==> $cilium_dir/config"
+if pool_errors=$(CILIUM_DIR="$cilium_dir" INGRESS_RENDER="$ingress_render" python3 - 2>&1 <<'PY'
 import ipaddress, os, pathlib, sys, yaml
 
-values = pathlib.Path("deployment/kube-system/cilium/values.yaml")
-pool_dir = pathlib.Path("deployment/kube-system/cilium-config")
+chart = pathlib.Path(os.environ["CILIUM_DIR"])
+values = chart / "values.yaml"
+pool_dir = chart / "config"
 render = pathlib.Path(os.environ["INGRESS_RENDER"])
 
 errors = []
@@ -179,8 +192,8 @@ services = [d for d in docs
             if d.get("kind") == "Service"
             and (d.get("metadata") or {}).get("name") == "cilium-ingress"]
 if not docs:
-    errors.append("the cilium chart rendered nothing -- deployment/kube-system/cilium is"
-                  " where the ingress Service comes from")
+    errors.append(f"the cilium chart rendered nothing -- {chart} is where the ingress"
+                  " Service comes from")
 elif not services:
     errors.append("the cilium render has no cilium-ingress Service, so nothing carries the"
                   f" pin -- check cilium.ingressController.enabled in {values}")

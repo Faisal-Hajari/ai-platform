@@ -35,20 +35,19 @@ cilium:
   # 10.244.0.0/16 is disjoint from 10.96.0.0/12. At the default /24 mask size that is
   # 256 nodes, which this cluster will not outgrow.
   #
-  # REBUILD-ONLY, AND MERGE FIRST. This is an init-time setting that the ApplicationSet
-  # will happily push at a running cluster -- its syncPolicy is automated with selfHeal,
-  # so a change here applies within minutes of landing on main. A live node's CiliumNode
-  # already holds a /24 from the old pool, and the operator cannot renumber it.
+  # REBUILD-ONLY. `helm upgrade` will push a new value at a running cluster quite
+  # happily, and it will not take: a live node's CiliumNode already holds a /24 out of
+  # the old pool and the operator cannot renumber it, while kubeadm's --pod-network-cidr
+  # was fixed at init.
   #
-  # The order is load-bearing, because the two consumers of this file read different
-  # revisions: the playbook reads the local checkout, while the ApplicationSet it
-  # installs tracks main. Rebuilding from an unmerged branch therefore brings pods up on
-  # the new pool, then lets ArgoCD selfHeal cilium-config back to whatever main says --
-  # stranding the node's allocation outside the configured pool and restoring the very
-  # overlap this key exists to remove.
+  # This used to say MERGE FIRST as well, because the file had two readers on two
+  # revisions -- the playbook on the local checkout, ArgoCD on main -- so rebuilding from
+  # an unmerged branch brought pods up on the new pool and then let selfHeal put the old
+  # one back. That reader is gone (see ../README.md): a change here reaches the cluster
+  # only through the checkout the playbook reads, and through nothing else.
   #
-  # So: merge and push to main, THEN infrastructure/scripts/nuke_cluster.sh, THEN re-run
-  # the playbook, which reads this file for `kubeadm init --pod-network-cidr`.
+  # So: infrastructure/scripts/nuke_cluster.sh, THEN re-run the playbook, which reads
+  # this file both for `kubeadm init --pod-network-cidr` and as the chart's values.
   ipam:
     operator:
       clusterPoolIPv4PodCIDRList: ["10.244.0.0/16"]
@@ -74,10 +73,13 @@ cilium:
     service:
       annotations:
         # Pin the shared entrypoint so ingress hostnames have a stable A record.
-        # ../cilium-config/ip-pool.yaml names this range explicitly, so .200 is an
-        # address that file spells out rather than one it happens to cover -- keep the
-        # two in step; infrastructure/scripts/check_deployments.sh fails if they drift,
-        # and .github/workflows/check-deployments.yml runs it on every change here.
+        # config/ip-pool.yaml names this range explicitly, so .200 is an address that
+        # file spells out rather than one it happens to cover -- keep the two in step;
+        # infrastructure/scripts/check_deployments.sh fails if they drift, and
+        # .github/workflows/check-deployments.yml runs it on every change here. The
+        # playbook applies both in one step now, so they can no longer disagree while
+        # two Applications sync in an arbitrary order -- but they can still be edited
+        # apart, which is what the check is for.
         # LB-IPAM's own annotation, rather than spec.loadBalancerIP, which k8s
         # deprecated in 1.24.
         lbipam.cilium.io/ips: "192.168.100.200"

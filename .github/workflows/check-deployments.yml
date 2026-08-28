@@ -1,15 +1,21 @@
-# ArgoCD's ApplicationSet syncs deployment/ straight from main with an automated,
-# selfHeal policy: whatever merges here is on the cluster within minutes, with no
-# staging step in between. check_deployments.sh is the only thing that inspects these
-# files before that happens, and its header rightly says "run before pushing" -- which
-# is advice, not a guarantee. This runs it on the changes themselves, so the invariants
-# it asserts (#26) hold for anything that reaches main.
+# check_deployments.sh is the only thing that inspects these files before they reach a
+# cluster, and its header rightly says "run before pushing" -- which is advice, not a
+# guarantee. This runs it on the changes themselves, so the invariants it asserts (#26)
+# hold for anything that reaches main.
+#
+# The two halves reach the cluster differently and both need it. ArgoCD syncs
+# deployment/ straight from main with an automated, selfHeal policy, so whatever merges
+# there is applied within minutes with no staging step in between. system-apps/ waits
+# for someone to re-run the playbook -- slower, but nothing reconciles behind it either,
+# so a bad value sits in main looking correct until the next bootstrap picks it up. That
+# is a longer fuse, not a shorter one.
 name: check deployments
 
 on:
   pull_request:
     paths:
       - 'deployment/**'
+      - 'infrastructure/k8s-ansible/system-apps/**'
       - 'infrastructure/scripts/check_deployments.sh'
       - 'infrastructure/k8s-ansible/playbook.yml'
       - '.github/workflows/check-deployments.yml'
@@ -17,6 +23,7 @@ on:
     branches: [main]
     paths:
       - 'deployment/**'
+      - 'infrastructure/k8s-ansible/system-apps/**'
       - 'infrastructure/scripts/check_deployments.sh'
       - 'infrastructure/k8s-ansible/playbook.yml'
       - '.github/workflows/check-deployments.yml'
