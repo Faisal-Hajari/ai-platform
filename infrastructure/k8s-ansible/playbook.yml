@@ -22,8 +22,14 @@
 
   tasks:
     # ── Swap ──────────────────────────────────────────────
+    # swapoff -a is unconditional, so on its own it reports a change on every run for the
+    # rest of the cluster's life -- long after `Remove swap from fstab` below made sure
+    # there is nothing left to turn off. Gate it on the fact instead of silencing it with
+    # `changed_when: false`: a node that really does come up with swap on is a change,
+    # and should still be reported as one.
     - name: Disable swap
       command: swapoff -a
+      when: ansible_facts['swaptotal_mb'] | default(0) | int > 0
 
     - name: Remove swap from fstab
       replace:
@@ -105,6 +111,12 @@
         replace: 'SystemdCgroup = true'
       notify: restart containerd
 
+    # A no-op against `containerd config default` output, which enables CRI and has no
+    # disabled_plugins line at all; it only bites against the Ubuntu package's stub, which
+    # ships `disabled_plugins = ["cri"]`. That is the same stub the guard above is written
+    # for, so the two are a pair: whenever this task has anything to do, generation has
+    # just been skipped and the config is the stub -- and it is the assert below, not
+    # either replace, that decides whether the node ended up correct.
     - name: Enable CRI plugin in containerd config
       replace:
         path: /etc/containerd/config.toml
@@ -423,9 +435,17 @@
       register: argocd_ns
       failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
 
+    # --server-side, but deliberately not --force-conflicts. The manifest is re-applied
+    # on every run, so --force-conflicts is not a one-off override: it standingly takes
+    # ownership of any field another manager has set since -- an operator, a hand patch,
+    # a chart layered on top -- and reverts it silently on the next run. A conflict is
+    # the useful signal that something outside this playbook is managing part of ArgoCD,
+    # so let it stop the run and be resolved deliberately. The field manager is left at
+    # kubectl's default so this keeps ownership of the fields the earlier forced applies
+    # already claimed.
     - name: Install ArgoCD
       command: >
-        kubectl apply -n argocd --server-side --force-conflicts
+        kubectl apply -n argocd --server-side
         -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
