@@ -3,13 +3,18 @@
 #
 # Because kubeadm runs with --skip-phases=addon/kube-proxy, nothing programs the
 # kubernetes ClusterIP until Cilium is up -- so Cilium cannot reach the API server
-# through it. The Helm chart only injects KUBERNETES_SERVICE_HOST/PORT when
-# k8sServiceHost is set in deployment/kube-system/cilium/values.yaml; the `cilium
-# install` CLI sets it automatically. If those two disagree, ArgoCD reconciles the
-# setting away and Cilium deadlocks on itself.
+# through it. The chart only injects KUBERNETES_SERVICE_HOST/PORT when k8sServiceHost is
+# set in infrastructure/k8s-ansible/system-apps/cilium/values.yaml, and that address is
+# a DHCP lease: when the lease moves, the pinned value is stale and Cilium deadlocks
+# against 10.96.0.1 on its next restart.
 #
-# Push the k8sServiceHost fix to values.yaml FIRST. ArgoCD syncs with selfHeal=true
-# and will revert these patches once it is running again.
+# The patches below are a stopgap either way, but what undoes them has changed. ArgoCD
+# no longer syncs this chart, so nothing reverts them within minutes any more -- the
+# next `helm upgrade --install` from the playbook does, which is also the thing that
+# reads the corrected values.yaml. So: patch to get the cluster back, fix k8sServiceHost
+# (the playbook asserts it is an address this host holds), then re-run the playbook.
+# Note that a moved lease also leaves the API server advertising the old address, which
+# these patches cannot fix -- see the DHCP paragraph in README.md.
 
 set -euo pipefail
 

@@ -6,14 +6,23 @@ System for serving AI models over k8s
 - `infrastructure/k8s-ansible/` — the Ansible play that bootstraps the node: containerd,
   kubeadm, Cilium (as the CNI *and* the ingress controller, with kube-proxy skipped) and
   ArgoCD.
-- `deployment/` — the charts and manifests ArgoCD syncs. The ApplicationSet in
-  `infrastructure/k8s-ansible/argocd/applicationset.yaml` picks them up from here.
+- [`infrastructure/k8s-ansible/system-apps/`](infrastructure/k8s-ansible/system-apps/README.md)
+  — what ArgoCD needs in order to run, deployed by that play: the Cilium chart and its
+  configuration, and ArgoCD's own ApplicationSet. Exactly two members, and that README
+  states the rule for what may join them.
+- [`deployment/`](deployment/README.md) — the charts and manifests ArgoCD syncs. The
+  ApplicationSet picks them up from here. Empty today.
 - `infrastructure/scripts/` — operational scripts, described below.
+
+The split is the point: the ApplicationSet's generator path is `deployment/*/*`, so it
+cannot reach `system-apps/` and needs no exclusion list. Cilium sat inside `deployment/`
+until #38, which meant the generator's `prune`/`selfHeal` policy applied to the CNI —
+a controller reconciling the network it runs on.
 
 ### Application names
 
-The generated Applications are named `<namespace>-<chart>` — the directory
-`deployment/kube-system/cilium` becomes the Application `kube-system-cilium`. The leaf
+The generated Applications are named `<namespace>-<chart>` — a directory
+`deployment/ai-services/vllm` becomes the Application `ai-services-vllm`. The leaf
 directory alone is not unique: it is only namespaced by the directory above it, so
 `deployment/ingress/nginx` and `deployment/ai-services/nginx` would name the same
 Application twice and each reconcile would overwrite the other's namespace and path.
@@ -35,10 +44,14 @@ ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass
 `ansible_become_pass` from the vault-encrypted `vault.yml` beside it, so the run cannot
 load group_vars without the secret. `--vault-password-file` works too.
 
-`repo_path` is the repository root, which the play reads Cilium's values and the
-ApplicationSet from. It already defaults to `/home/{{ ansible_user }}/dev/ai-platform` in
+`repo_path` is the repository root, which the play reads `system-apps/` out of — the
+Cilium chart it installs with Helm, its LoadBalancer configuration, and the
+ApplicationSet. It already defaults to `/home/{{ ansible_user }}/dev/ai-platform` in
 `group_vars/k8s-master/vars.yml`; pass `-e repo_path=...` only if the checkout lives
 somewhere else.
+
+Re-running the play is also the *only* update path for anything under `system-apps/`:
+nothing reconciles behind it, and `helm upgrade --install` corrects drift on every run.
 
 ## Host-specific values
 
@@ -48,11 +61,11 @@ editing these — nothing discovers them at run time.
 
 | Value | Declared in | Consumed by |
 |---|---|---|
-| API server address | [`deployment/kube-system/cilium/values.yaml`](deployment/kube-system/cilium/values.yaml) (`k8sServiceHost`) | Cilium's direct dial, **and** `kubeadm init --apiserver-advertise-address` — the playbook reads this key, so both are pinned to the one value |
+| API server address | [`system-apps/cilium/values.yaml`](infrastructure/k8s-ansible/system-apps/cilium/values.yaml) (`k8sServiceHost`) | Cilium's direct dial, **and** `kubeadm init --apiserver-advertise-address` — the playbook reads this key, so both are pinned to the one value |
 | Pod CIDR | same file (`ipam.operator.clusterPoolIPv4PodCIDRList`) | Cilium's allocator **and** `kubeadm init --pod-network-cidr`, same way. Rebuild-only; see the comment there |
 | Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Must sit inside the pool below |
-| LoadBalancer pool | [`deployment/kube-system/cilium-config/ip-pool.yaml`](deployment/kube-system/cilium-config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope |
-| NIC name (`eno1`) | [`deployment/kube-system/cilium-config/l2-policy.yaml`](deployment/kube-system/cilium-config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses |
+| LoadBalancer pool | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope |
+| NIC name (`eno1`) | [`system-apps/cilium/config/l2-policy.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses |
 | Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible; `repo_path` in `group_vars/` is derived from it |
 
 The API server address and the pod CIDR used to be written twice each — once for Cilium
@@ -82,8 +95,8 @@ Each script carries a shebang and is executable, so run it directly.
 | --- | --- |
 | `install_ansible.sh` | Installs Ansible from the PPA on the control node. |
 | `install_ssh.sh` | Installs and enables `sshd`. |
-| `check_deployments.sh` | Renders every chart under `deployment/` the way ArgoCD will and asserts the invariants that have bitten this cluster before. Run before pushing changes to `deployment/`. |
-| `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Push the `k8sServiceHost` fix to `values.yaml` first — ArgoCD self-heals these patches away. |
+| `check_deployments.sh` | Renders every chart in `system-apps/` and `deployment/` the way its deployer will and asserts the invariants that have bitten this cluster before. Run before pushing changes to either. |
+| `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Fix `k8sServiceHost` in `values.yaml` and re-run the playbook afterwards — the patches are a stopgap, and the playbook is now the only thing that renders Cilium. |
 | `recover_apiserver.sh` | Clears a static pod wedged in `CreateContainerError` after a backward clock step. Needs root and `crictl`. |
 | `nuke_cluster.sh` | Tears the cluster down far enough for the playbook to rebuild it, including the Cilium node-local state `kubeadm reset` leaves behind. Needs root and `crictl`. |
 
@@ -94,7 +107,7 @@ CRI through it — without it the reset reports success while leaving containers
 It is not packaged on Ubuntu; install it from cri-tools.
 
 Pinned to a version and to the SHA256 of the release artefact itself, on the same
-reasoning as the Cilium CLI and Helm pins in `playbook.yml`: the checksum is what makes
+reasoning as the Helm pin in `playbook.yml`: the checksum is what makes
 the version mean anything, and it is per version and per architecture, so bumping
 `VERSION` means replacing both digests. Only amd64 and arm64 are pinned — on anything
 else `ARCH` stays unset, the download 404s, and the chain stops before `sudo tar`.

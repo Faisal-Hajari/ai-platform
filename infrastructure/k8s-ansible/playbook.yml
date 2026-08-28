@@ -3,22 +3,24 @@
   hosts: k8s-cluster
   become: true
 
-  # Kubernetes, Cilium and ArgoCD are pinned inline below; the two tools that are
-  # fetched as binaries rather than from a signed apt repo are pinned here, each with
-  # the SHA256 of the release artefact itself. A checksum published beside the download
-  # only proves the bytes arrived intact -- it says nothing about which version a run
-  # picked, so resolving the version at runtime (from a branch tip, as this used to do)
-  # meant two nodes bootstrapped weeks apart got different tooling. Bumping a version
-  # here means replacing its checksums too: they are per version and per architecture.
+  # Kubernetes and ArgoCD are pinned inline below, Cilium in the chart this play
+  # deploys. Helm is fetched as a binary rather than from a signed apt repo, so it is
+  # pinned here with the SHA256 of the release artefact itself. A checksum published
+  # beside the download only proves the bytes arrived intact -- it says nothing about
+  # which version a run picked, so resolving the version at runtime (from a branch tip,
+  # as this used to do) meant two nodes bootstrapped weeks apart got different tooling.
+  # Bumping the version means replacing its checksums too: they are per version and per
+  # architecture.
   vars:
-    cilium_cli_version: v0.19.7
-    cilium_cli_sha256:
-      amd64: cd15e0983bf0acc7946cd05d453d1e58376ea92dec2642e745212df2b07d8852
-      arm64: 9482937f14061fb239f2dbb2f97f4103de1b101f5d5defbff319f294f9bd540f
     helm_version: v3.21.4
     helm_sha256:
       amd64: 61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
       arm64: b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a5fd3b85a7
+    # Everything ArgoCD needs in order to run, and nothing else -- the membership rule is
+    # in system-apps/README.md. These are deployed by this play; deployment/ is ArgoCD's
+    # half and this play never applies anything from it.
+    system_apps_dir: "{{ repo_path }}/infrastructure/k8s-ansible/system-apps"
+    cilium_chart_dir: "{{ system_apps_dir }}/cilium"
     # Ours to name -- nothing outside this play refers to it. ArgoCD finds it by label and
     # pairs it to a repository by URL, not by name.
     argocd_repo_secret_name: repo-ai-platform
@@ -31,11 +33,11 @@
     # ArgoCD pairs a credential to a repository by URL, so a credential registered for a URL
     # the ApplicationSet does not use is not an error, it is a silent no-op -- the very
     # failure the credential task exists to end. Read the URL back out of the ApplicationSet
-    # rather than restating it, the same way the Cilium install reads its values out of the
-    # manifest ArgoCD will later reconcile against.
+    # rather than restating it, the same way the Cilium install reads its values straight out
+    # of the chart it deploys.
     - name: Read the ApplicationSet
       set_fact:
-        argocd_appset: "{{ lookup('file', repo_path + '/infrastructure/k8s-ansible/argocd/applicationset.yaml') | from_yaml }}"
+        argocd_appset: "{{ lookup('file', system_apps_dir + '/argocd/applicationset.yaml') | from_yaml }}"
 
     # Only the generator's repo gets a credential, so a second generator would clone
     # uncredentialed and a template pointing elsewhere would sync uncredentialed -- both
@@ -101,21 +103,20 @@
 
   tasks:
     # ── Host identity ─────────────────────────────────────
-    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
-    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
-    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
+    # Read straight out of the values file the Cilium release is rendered from further
+    # down, so kubeadm and Cilium cannot be told different things about the same host.
+    # This used to be a defence against a second renderer as well -- ArgoCD syncing this
+    # chart with selfHeal, reconciling away whatever the bootstrap had set. There is no
+    # second renderer any more (see system-apps/README.md); the single-sourcing here is
+    # now only about kubeadm, which reads none of this file itself.
     #
     # First in the play, ahead of everything else, because the asserts below decide
     # whether this run can work at all. A moved DHCP lease should abort a pristine host,
     # not one that has already had swap disabled, /etc/fstab rewritten, sysctl files
     # dropped and kubeadm installed and held.
-    - name: Read the ArgoCD-managed Cilium values
+    - name: Read the Cilium values
       set_fact:
-        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
-
-    - name: Resolve the pinned Cilium Ingress address
-      set_fact:
-        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
+        cilium_values: "{{ lookup('file', cilium_chart_dir + '/values.yaml') | from_yaml }}"
 
     # Single source of truth for the pod range. Cilium in cluster-pool mode does not
     # read --pod-network-cidr, and kubeadm does not read clusterPoolIPv4PodCIDRList, so
@@ -177,8 +178,8 @@
           values.yaml declares k8sServiceHost={{ apiserver_advertise_address }}, but this
           host's usable addresses are {{ node_lan_addresses | join(', ') }} -- most likely
           the DHCP lease moved. Point k8sServiceHost in
-          deployment/kube-system/cilium/values.yaml at the address this node actually
-          holds, and give the node a reservation.
+          {{ cilium_chart_dir }}/values.yaml at the address this node actually holds, and
+          give the node a reservation.
         success_msg: >-
           API server will advertise {{ apiserver_advertise_address }}, which this host holds
 
@@ -558,108 +559,161 @@
           schedule on this cluster.
         success_msg: no node carries the control-plane taint
 
-    # ── Cilium CNI ────────────────────────────────────────
+    # ── Helm ──────────────────────────────────────────────
+    # The release tarball, not get-helm-3 from the branch tip: that script was unpinned,
+    # unverified, and ran as root -- and it resolves its own version at runtime anyway.
+    #
+    # Ahead of the CNI, because Helm is now what installs it. Cilium used to be rendered
+    # twice: the Cilium CLI here from a hand-written --set list, and the same chart again
+    # inside ArgoCD from values.yaml. Only the two keys this play read back out of that
+    # file were held in step, so every other setting existed in two places that agreed by
+    # hand -- which is the drift channel behind recover_cilium.sh. One renderer now: this
+    # Helm, against system-apps/cilium/. The Cilium CLI is no longer installed; its one
+    # remaining advantage was auto-detecting k8sServiceHost, and values.yaml pins that.
+    #
     # A missing key leaves this undefined rather than raising, so the assert below can
     # say which architecture had no pinned checksum instead of failing inside Jinja.
     - name: Resolve the release architecture
       set_fact:
         release_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] | default('') }}"
 
-    - name: Assert the architecture has pinned checksums
+    - name: Assert the architecture has a pinned checksum
       assert:
         that: release_arch != ''
         fail_msg: >-
-          No pinned Cilium CLI or Helm checksums for {{ ansible_facts['architecture'] }};
-          add them to the vars at the top of this play.
-        success_msg: "pinning {{ release_arch }} artefacts"
+          No pinned Helm checksum for {{ ansible_facts['architecture'] }}; add one to
+          the vars at the top of this play.
+        success_msg: "pinning the {{ release_arch }} artefact"
 
-    # `creates:` would keep whatever version a node happened to install first, so gate on
-    # the version the binary reports instead: bumping the pin above then actually upgrades
-    # it. `cilium version --client` exits non-zero when the CLI is absent, which reads as
-    # "not the pinned version" and installs it.
-    - name: Check the installed Cilium CLI version
-      command: cilium version --client
-      register: cilium_cli_installed
+    - name: Check the installed Helm version
+      command: helm version --short
+      register: helm_installed
       changed_when: false
       failed_when: false
 
-    # The gate resolves `cilium` through PATH while the tasks below write to
-    # /usr/local/bin, so a CLI already installed elsewhere skips the block entirely
-    # rather than leaving the chmod to fail on a path that was never going to exist.
-    - name: Install the pinned Cilium CLI
-      when: cilium_cli_version not in cilium_cli_installed.stdout
+    - name: Install the pinned Helm release
+      when: helm_version not in helm_installed.stdout
       block:
-        # Unpacked as root, so not through a predictable path in a world-writable /tmp.
-        - name: Create a scratch directory for the Cilium CLI download
+        - name: Create a scratch directory for the Helm download
           tempfile:
             state: directory
-            suffix: cilium-cli
-          register: cilium_cli_tmp
+            suffix: helm
+          register: helm_tmp
 
-        # get_url checks the checksum before the file lands, so a mismatch fails the task
-        # rather than leaving an unverified archive for the next task to unpack.
-        - name: Download the pinned Cilium CLI
+        - name: Download the pinned Helm release
           get_url:
-            url: >-
-              https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ release_arch }}.tar.gz
-            dest: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
-            checksum: sha256:{{ cilium_cli_sha256[release_arch] }}
+            url: https://get.helm.sh/helm-{{ helm_version }}-linux-{{ release_arch }}.tar.gz
+            dest: "{{ helm_tmp.path }}/helm.tar.gz"
+            checksum: sha256:{{ helm_sha256[release_arch] }}
             mode: '0644'
 
-        # A single-file archive, so it extracts straight into place. No mode here:
-        # unarchive applies file args to dest, and Ubuntu ships /usr/local/bin as
-        # 2775 root:staff. The binary's own mode is set below.
-        - name: Install the Cilium CLI
+        # Unpacked to the scratch directory rather than straight into /usr/local/bin
+        # because this tarball carries its LICENSE and README alongside the binary.
+        - name: Unpack Helm
           unarchive:
-            src: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
-            dest: /usr/local/bin
+            src: "{{ helm_tmp.path }}/helm.tar.gz"
+            dest: "{{ helm_tmp.path }}"
             remote_src: true
 
-        - name: Ensure the Cilium CLI is executable
-          file:
-            path: /usr/local/bin/cilium
+        - name: Install the Helm binary
+          copy:
+            src: "{{ helm_tmp.path }}/linux-{{ release_arch }}/helm"
+            dest: /usr/local/bin/helm
+            remote_src: true
             owner: root
             group: root
             mode: '0755'
 
-      # A checksum mismatch -- the intended outcome of a botched pin bump -- aborts the
-      # play, so a cleanup task sitting after the block would never run and every
-      # affected node would keep a root-owned scratch directory.
       always:
-        - name: Remove the Cilium CLI scratch directory
+        - name: Remove the Helm scratch directory
           file:
-            path: "{{ cilium_cli_tmp.path }}"
+            path: "{{ helm_tmp.path }}"
             state: absent
-          when: cilium_cli_tmp.path is defined
+          when: helm_tmp.path is defined
 
-    - name: Install or upgrade Cilium (bootstrap only)
-      shell: |
-        if cilium status --wait=false > /dev/null 2>&1; then
-          cilium upgrade --version v1.19.4 \
-            --set kubeProxyReplacement=true \
-            --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true \
-            --set ingressController.enabled=true \
-            --set ingressController.default=true \
-            --set ingressController.loadbalancerMode=shared \
-            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}' \
-            --set 'ipam.operator.clusterPoolIPv4PodCIDRList={{ '{' }}{{ pod_cidr }}{{ '}' }}'
-        else
-          cilium install --version v1.19.4 \
-            --set kubeProxyReplacement=true \
-            --set l2announcements.enabled=true \
-            --set externalIPs.enabled=true \
-            --set ingressController.enabled=true \
-            --set ingressController.default=true \
-            --set ingressController.loadbalancerMode=shared \
-            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}' \
-            --set 'ipam.operator.clusterPoolIPv4PodCIDRList={{ '{' }}{{ pod_cidr }}{{ '}' }}'
-        fi
+    # ── Cilium CNI ────────────────────────────────────────
+    # The chart is an umbrella over the upstream cilium chart, and charts/ and Chart.lock
+    # are gitignored -- they are a resolved cache, not source -- so the dependency has to
+    # be fetched on the node before anything can render. `update` rather than `build`
+    # because a fresh checkout has no lock file for `build` to read.
+    #
+    # become: false, like every task below it: repo_path is inside the operator's home,
+    # and a root-owned charts/ there would break the operator's own `helm dependency
+    # update` and infrastructure/scripts/check_deployments.sh afterwards.
+    - name: Resolve the Cilium chart's dependencies
+      command: helm dependency update {{ cilium_chart_dir }}
+      become: false
+      # Fills a gitignored cache in the checkout; it changes nothing about the node or
+      # the cluster, and reporting it would mark every run changed before helm has even
+      # been asked to do anything.
+      changed_when: false
+
+    # This used to be `cilium install`/`cilium upgrade` behind
+    # `creates: /etc/cni/net.d/05-cilium.conflist`, which made the bootstrap one-shot: the
+    # guard skipped the whole task once the conflist existed, so the upgrade branch inside
+    # it was unreachable and ArgoCD was the only thing that could change Cilium on a live
+    # cluster. Nothing reconciles behind this play any more, so "re-run the playbook" is
+    # the only update path there is and it has to actually work. `helm upgrade --install`
+    # is its own guard, and needs no `creates:`.
+    #
+    # No -f: values.yaml sits inside the chart, so it is already the chart's defaults --
+    # the same file, read the same way, as `helm template` in check_deployments.sh.
+    #
+    # --wait because the tasks after this one need a working datapath: without it ArgoCD's
+    # pods are scheduled against a CNI that may not be ready and its 120s rollout waits
+    # race the agent coming up. Deliberately not --atomic: rolling a half-applied CNI back
+    # to the previous release is not a safer place to leave the node than forward.
+    #
+    # This reports changed on every run and that is honest, not noise: helm has no dry-run
+    # that answers "would this change anything" cheaply, and gating the upgrade on the
+    # rendered manifest matching the last release would skip the three-way merge that
+    # corrects drift -- which, with no reconciler behind it, is the whole point of re-running.
+    - name: Install or upgrade Cilium
+      command: >-
+        helm upgrade --install cilium {{ cilium_chart_dir }}
+        --namespace kube-system
+        --wait --timeout 10m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
-      args:
-        creates: /etc/cni/net.d/05-cilium.conflist
+
+    # The pool and the L2 policy are CiliumLoadBalancerIPPool and
+    # CiliumL2AnnouncementPolicy, and those CRDs are registered by cilium-operator at
+    # runtime -- the chart does not ship them under crds/, so --wait above says nothing
+    # about whether they exist yet. Polling for the object first, then waiting on
+    # Established: `kubectl wait` errors immediately on a resource that is not there at
+    # all, so waiting alone would fail on exactly the cold run this exists for.
+    - name: Wait for the Cilium CRDs the configuration below needs
+      shell: |
+        set -eu
+        for crd in ciliumloadbalancerippools.cilium.io ciliuml2announcementpolicies.cilium.io; do
+          for _ in $(seq 60); do
+            kubectl get crd "$crd" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          kubectl wait --for=condition=established --timeout=60s crd/"$crd"
+        done
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      changed_when: false
+
+    # Part of the Cilium unit, not a thing of its own. The ingress pin in values.yaml has
+    # to sit inside the pool declared here, and while these were two separately-synced
+    # ArgoCD Applications there was no ordering between them: the pair could disagree
+    # transiently even with both files correct (#26). One step, ordered after the chart.
+    #
+    # Stated trade: `kubectl apply -f` has no prune, so deleting a pool from git leaves it
+    # in the cluster. Accepted for two small manifests -- deleting one is rare and the
+    # cluster tells you loudly when a pool is wrong -- but it is a decision, and removing
+    # one of these means also deleting it by hand.
+    - name: Apply the Cilium configuration
+      command: kubectl apply -f {{ cilium_chart_dir }}/config/
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      register: cilium_config
+      changed_when: cilium_config.stdout_lines | reject('search', ' unchanged$') | list | length > 0
 
     # ── ArgoCD ────────────────────────────────────────────
     - name: Create argocd namespace
@@ -801,7 +855,7 @@
       no_log: true
 
     - name: Apply ArgoCD ApplicationSet
-      command: kubectl apply -f {{ repo_path }}/infrastructure/k8s-ansible/argocd/applicationset.yaml
+      command: kubectl apply -f {{ system_apps_dir }}/argocd/applicationset.yaml
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
@@ -848,55 +902,6 @@
           generating no Applications and nothing under deployment/ will sync:
           {{ appset_conditions.stdout | default('', true) or appset_ready.stderr }}
         success_msg: ArgoCD has resolved the deployment repository
-
-    # ── Helm ──────────────────────────────────────────────
-    # The release tarball, not get-helm-3 from the branch tip: that script was unpinned,
-    # unverified, and ran as root -- and it resolves its own version at runtime anyway.
-    - name: Check the installed Helm version
-      command: helm version --short
-      register: helm_installed
-      changed_when: false
-      failed_when: false
-
-    - name: Install the pinned Helm release
-      when: helm_version not in helm_installed.stdout
-      block:
-        - name: Create a scratch directory for the Helm download
-          tempfile:
-            state: directory
-            suffix: helm
-          register: helm_tmp
-
-        - name: Download the pinned Helm release
-          get_url:
-            url: https://get.helm.sh/helm-{{ helm_version }}-linux-{{ release_arch }}.tar.gz
-            dest: "{{ helm_tmp.path }}/helm.tar.gz"
-            checksum: sha256:{{ helm_sha256[release_arch] }}
-            mode: '0644'
-
-        # Unpacked to the scratch directory rather than straight into /usr/local/bin
-        # because this tarball carries its LICENSE and README alongside the binary.
-        - name: Unpack Helm
-          unarchive:
-            src: "{{ helm_tmp.path }}/helm.tar.gz"
-            dest: "{{ helm_tmp.path }}"
-            remote_src: true
-
-        - name: Install the Helm binary
-          copy:
-            src: "{{ helm_tmp.path }}/linux-{{ release_arch }}/helm"
-            dest: /usr/local/bin/helm
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0755'
-
-      always:
-        - name: Remove the Helm scratch directory
-          file:
-            path: "{{ helm_tmp.path }}"
-            state: absent
-          when: helm_tmp.path is defined
 
   handlers:
     - name: restart containerd

@@ -1,3 +1,7 @@
-# Resolved by `helm dependency update` (and by ArgoCD at sync time) -- not source.
+# Resolved by `helm dependency update` -- not source. Under deployment/ that resolution
+# happens inside ArgoCD's repo-server at sync time; under system-apps/ the playbook runs
+# it on the node before `helm upgrade --install`. Either way the checkout is a cache.
 deployment/*/*/charts/
 deployment/*/*/Chart.lock
+infrastructure/k8s-ansible/system-apps/*/charts/
+infrastructure/k8s-ansible/system-apps/*/Chart.lock

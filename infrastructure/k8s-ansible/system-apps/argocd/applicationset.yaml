@@ -15,6 +15,16 @@ spec:
         # that they are.
         repoURL: git@github.com:Faisal-Hajari/ai-platform.git
         revision: main
+        # deployment/ only, and no exclusion list: what ArgoCD itself runs on lives in
+        # infrastructure/k8s-ansible/system-apps/, which this path cannot reach. That is
+        # the point of the split -- the CNI and this ApplicationSet were once inside
+        # deployment/ and picked up by this very generator, which put prune and selfHeal
+        # on the datapath. Keeping the generator dumb is what makes it impossible to
+        # re-match them by accident, so do not widen this path to catch them back.
+        #
+        # deployment/ can legitimately be empty -- it is today. Zero generated
+        # Applications is not breakage; the playbook still asserts that the generator
+        # resolved, which is what proves ArgoCD can clone the repo.
         directories:
           - path: deployment/*/*
   template:

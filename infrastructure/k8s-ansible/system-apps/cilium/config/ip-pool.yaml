@@ -12,15 +12,15 @@ spec:
     #
     # The floor stayed at .192 for a while longer because default/test-nginx held
     # .192 and moving the floor would have evicted it onto the .200 that
-    # ../cilium/values.yaml pins for the ingress. That service was an untracked
+    # ../values.yaml pins for the ingress. That service was an untracked
     # hand-made test fixture (#16) and has since been deleted, so the floor is free
     # to be what it was always meant to be.
     #
-    # .200 is the address ../cilium/values.yaml pins for kube-system/cilium-ingress
-    # via lbipam.cilium.io/ips -- keep the two in step.
+    # .200 is the address ../values.yaml pins for kube-system/cilium-ingress via
+    # lbipam.cilium.io/ips -- keep the two in step.
     # infrastructure/scripts/check_deployments.sh asserts that containment, including
     # the CIDR normalization above, and .github/workflows/check-deployments.yml runs it
-    # on every change under deployment/. That run going red is the warning that arrives
+    # on every change to this chart. That run going red is the warning that arrives
     # before the cluster's, which is IPAMRequestSatisfied=False and every Ingress dead --
     # a signal, not a merge gate, so do not sail past it.
     - start: "192.168.100.200"

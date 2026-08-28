@@ -46,7 +46,7 @@ rm -rf /etc/kubernetes
 # init container recreates it on the next install. This is housekeeping, NOT the guard:
 # it is best-effort by design (EBUSY, stacked mounts from repeated init-container runs),
 # and the path is the chart default for cgroup.hostRoot, so overriding that key in
-# ../../deployment/kube-system/cilium/values.yaml would silently make this a no-op. The
+# ../k8s-ansible/system-apps/cilium/values.yaml would silently make this a no-op. The
 # guard is --one-file-system on the rm below.
 umount /run/cilium/cgroupv2 2>/dev/null || true
 
