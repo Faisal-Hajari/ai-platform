@@ -21,7 +21,18 @@ fail=0
 ingress_render=$(mktemp)
 trap 'rm -f "$ingress_render"' EXIT
 
-for chart in deployment/*/*/Chart.yaml; do
+# Without nullglob an empty deployment/ hands the unexpanded pattern to helm, and the
+# run ends on helm's complaint about a directory named `*` -- an error that says nothing
+# about the invariants that went unchecked.
+shopt -s nullglob
+charts=(deployment/*/*/Chart.yaml)
+if [ "${#charts[@]}" -eq 0 ]; then
+  echo "==> deployment"
+  echo "    FAIL: no charts found -- deployment/*/*/Chart.yaml matched nothing"
+  fail=1
+fi
+
+for chart in "${charts[@]}"; do
   dir=$(dirname "$chart")
   # Per-chart. `fail` used to be the only flag and was never reset, so once any chart
   # failed, every chart after it stopped printing `ok` and read as though it had failed
@@ -106,7 +117,11 @@ def parse_block(name, block, allow_first_last):
         host_bits = net.max_prefixlen - net.prefixlen
         if not allow_first_last and host_bits > 1:
             first, last = net[1], net[-2]
-        return f"{name}: {block['cidr']}", first, last
+        # Both spellings, because neither transformation above is visible in the literal
+        # and the message is the whole operator-facing surface of this check. Told only
+        # that .192 is outside "192.168.100.200/28" -- which contains it -- the reader
+        # would reasonably conclude the checker is broken.
+        return f"{name}: {block['cidr']} ({first}-{last})", first, last
     first, last = ipaddress.ip_address(block["start"]), ipaddress.ip_address(block["stop"])
     if last < first:
         raise ValueError(f"stop {last} precedes start {first}")
