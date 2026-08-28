@@ -123,6 +123,60 @@
         - kubeadm
         - kubectl
 
+    # ── Clock ─────────────────────────────────────────────
+    # chrony ships with `makestep 1 3`, so it steps the clock outright for its first
+    # few updates after boot. If kubelet and containerd are already recording container
+    # lifecycle timestamps when that jump happens, their bookkeeping ends up inverted
+    # (a container finishing hours before it started) and kubelet can decide a healthy
+    # container died. It then retries CreateContainer forever against a name reservation
+    # held by a half-created container -- a wedge that survives restarting either daemon,
+    # because containerd re-reserves the name from the orphan's record in bolt on startup.
+    # See infrastructure/scripts/recover_apiserver.sh to clear a node already stuck.
+    #
+    # chrony-wait blocks until the clock is within 0.1s, which is what makes
+    # time-sync.target mean anything; the drop-ins hold both daemons behind it. Cost: on
+    # a boot where NTP is unreachable both daemons start up to 180s late, bounded by
+    # chrony-wait's own TimeoutStartSec -- the boot does not hang.
+    - name: Install chrony
+      apt:
+        name: chrony
+        state: present
+
+    - name: Enable and start chrony
+      service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Enable chrony-wait so time-sync.target means the clock has settled
+      service:
+        name: chrony-wait
+        enabled: true
+
+    - name: Create systemd drop-in directories for kubelet and containerd
+      file:
+        path: /etc/systemd/system/{{ item }}.service.d
+        state: directory
+        mode: '0755'
+      loop:
+        - kubelet
+        - containerd
+
+    - name: Order kubelet and containerd after the clock is synchronised
+      copy:
+        dest: /etc/systemd/system/{{ item }}.service.d/10-time-sync.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After=time-sync.target
+      loop:
+        - kubelet
+        - containerd
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
     # ── Cluster init ──────────────────────────────────────
     - name: Initialize Kubernetes cluster
       command: kubeadm init --pod-network-cidr=10.0.0.0/8 --skip-phases=addon/kube-proxy
