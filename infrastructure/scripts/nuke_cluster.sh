@@ -8,6 +8,64 @@ kubeadm reset -f
 
 rm -rf /etc/cni/net.d
 rm -rf /etc/kubernetes
+
+# kubeadm reset explicitly leaves CNI-created interfaces, mounts and any state outside
+# /etc/kubernetes alone, so Cilium's node-local state outlives the nuke: cilium_host
+# keeps the old router IP (and its /24 route), cilium_vxlan the old tunnel,
+# /var/run/cilium/state the endpoint state, and the pinned BPF maps the ipcache and
+# service entries -- all keyed to the old pod CIDR.
+#
+# That was harmless while the pod CIDR never changed. It is not once it does. The agent
+# is supposed to notice stale state and discard it; clearing it outright means not
+# depending on that on the one run where rollback is hardest.
+
+# /run/cilium/cgroupv2 is NOT Cilium state -- it is Cilium's automount of the host's
+# unified cgroup hierarchy (cgroup.autoMount.enabled), left behind in the host mount
+# namespace when the pod died, and kubeadm reset does not unmount it. Since /var/run is
+# a symlink to /run, a plain recursive delete of /var/run/cilium walks into the live
+# cgroup root: EPERM on every control file, and -- because kubeadm reset has just
+# stopped every container -- successful rmdir on the now-empty cgroups behind
+# kubepods.slice and friends.
+#
+# Drop the stale mount, which is worth cleaning up in its own right; the mount-cgroup
+# init container recreates it on the next install. This is housekeeping, NOT the guard:
+# it is best-effort by design (EBUSY, stacked mounts from repeated init-container runs),
+# and the path is the chart default for cgroup.hostRoot, so overriding that key in
+# ../../deployment/kube-system/cilium/values.yaml would silently make this a no-op. The
+# guard is --one-file-system on the rm below.
+umount /run/cilium/cgroupv2 2>/dev/null || true
+
+# cilium_net is cilium_host's veth peer and goes with it. Per-endpoint lxc* veths go
+# with their containers.
+ip link del cilium_host 2>/dev/null || true
+ip link del cilium_vxlan 2>/dev/null || true
+
+# --one-file-system is what actually keeps this delete out of the cgroup hierarchy: it
+# skips any directory on a different filesystem from the argument, so the recursion
+# stops at a mount boundary whether or not the umount above worked and whatever
+# cgroup.hostRoot points at. /run/cilium is tmpfs (dev 29) and /run/cilium/cgroupv2 is
+# cgroup2fs (dev 30), so the boundary is real. GNU coreutils only; this box has 9.7.
+#
+# /var/lib/cilium does not exist on this node today (endpoint state lives under
+# /var/run/cilium/state); it is listed because Cilium uses it when state-dir is moved
+# off tmpfs, and the rm is a no-op when absent.
+rm -rf --one-file-system /var/run/cilium /var/lib/cilium
+
+# bpffs is its own mount, so nothing above touches the pinned maps -- cilium_ipcache,
+# cilium_lxc, cilium_lb4_services_v2, cilium_tunnel_map. Cilium itself only clears them
+# via the clean-cilium-state init container, which needs CLEAN_CILIUM_STATE, and the
+# bootstrap install does not set it. Without this the agent comes up on the new pool
+# reading maps still full of 10.0.0.0/24.
+#
+# find, not a `cilium_*` glob: under zsh an unmatched glob is a fatal error for the
+# command rather than a literal passed through as it is in bash, so the cleanup would be
+# skipped on exactly the runs where the directory is already clean. That bites only when
+# this file is handed to zsh explicitly (`sudo zsh nuke_cluster.sh`) -- running it as a
+# program is unaffected, since a no-shebang file fails execve with ENOEXEC and the
+# caller falls back to /bin/sh (dash here), not to itself. Narrow, but free to avoid.
+find /sys/fs/bpf/tc/globals -maxdepth 1 -name 'cilium_*' -exec rm -rf {} + 2>/dev/null || true
+rm -rf /sys/fs/bpf/cilium
+
 # Run as root via sudo, so ~ is /root -- that misses the invoking user's config,
 # the one the playbook installs. Both are stale after a nuke: root's if the
 # operator did the kubeadm post-init copy so `sudo kubectl` works, the user's

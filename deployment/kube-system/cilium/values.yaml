@@ -5,6 +5,43 @@ cilium:
   k8sServiceHost: 192.168.100.19
   k8sServicePort: 6443
   kubeProxyReplacement: true
+
+  # The pod range. This is the ONLY place it is written down -- the Ansible playbook
+  # reads this key to build `kubeadm init --pod-network-cidr`, so kubeadm and Cilium
+  # cannot disagree about it.
+  #
+  # It has to be set explicitly, because kubeadm does not feed it. In cluster-pool
+  # mode Cilium ignores --pod-network-cidr entirely and allocates node /24s out of
+  # clusterPoolIPv4PodCIDRList, whose chart default is 10.0.0.0/8. That default
+  # encloses the kubeadm default service range 10.96.0.0/12, so the pod allocator
+  # could in principle hand out a block on top of the service CIDR -- and with
+  # kubeProxyReplacement the datapath keys service handling off that range, so such
+  # an address is ambiguous. Setting this key alone would fix that overlap -- but it
+  # would leave --pod-network-cidr describing a range nothing uses, since kubeadm's
+  # value reaches only kube-controller-manager's --cluster-cidr and node.spec.podCIDR,
+  # which Cilium does not consult and, with no kube-proxy, nothing else reads either.
+  # Hence both, from this one value.
+  #
+  # 10.244.0.0/16 is disjoint from 10.96.0.0/12. At the default /24 mask size that is
+  # 256 nodes, which this cluster will not outgrow.
+  #
+  # REBUILD-ONLY, AND MERGE FIRST. This is an init-time setting that the ApplicationSet
+  # will happily push at a running cluster -- its syncPolicy is automated with selfHeal,
+  # so a change here applies within minutes of landing on main. A live node's CiliumNode
+  # already holds a /24 from the old pool, and the operator cannot renumber it.
+  #
+  # The order is load-bearing, because the two consumers of this file read different
+  # revisions: the playbook reads the local checkout, while the ApplicationSet it
+  # installs tracks main. Rebuilding from an unmerged branch therefore brings pods up on
+  # the new pool, then lets ArgoCD selfHeal cilium-config back to whatever main says --
+  # stranding the node's allocation outside the configured pool and restoring the very
+  # overlap this key exists to remove.
+  #
+  # So: merge and push to main, THEN infrastructure/scripts/nuke_cluster.sh, THEN re-run
+  # the playbook, which reads this file for `kubeadm init --pod-network-cidr`.
+  ipam:
+    operator:
+      clusterPoolIPv4PodCIDRList: ["10.244.0.0/16"]
   l2announcements:
     enabled: true
   externalIPs:
