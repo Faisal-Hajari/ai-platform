@@ -1,7 +1,13 @@
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: local-pool
 spec:
   blocks:
-    - cidr: "192.168.100.200/28"
+    # Written as start/stop, not a CIDR. "192.168.100.200/28" is not on a /28
+    # boundary, so LB-IPAM normalized it to 192.168.100.192/28 and handed out .192
+    # first -- the range did not mean what it read. These bounds are the range that
+    # was intended, and they make the .200 pinned by the Cilium ingress service
+    # (../cilium/values.yaml) an address this file actually names.
+    - start: "192.168.100.200"
+      stop: "192.168.100.215"

@@ -12,8 +12,10 @@ cilium:
   operator:
     replicas: 1
 
-  # Cilium serves Ingress itself -- no separate ingress controller. Envoy runs in the
-  # cilium-agent, so L7 routing happens on the same datapath as the rest of the network.
+  # Cilium serves Ingress itself -- no separate ingress controller. L7 routing runs on
+  # the standalone cilium-envoy DaemonSet (envoy.enabled defaults to true in 1.19, so
+  # that DaemonSet is already running); enabling this adds no new workload, it just
+  # gives the Envoy we already pay for something to do.
   ingressController:
     enabled: true
     # Own the unclassed Ingresses too, so `kubectl get ingress` objects need no
@@ -23,8 +25,9 @@ cilium:
     # (kube-system/cilium-ingress) instead of one service -- and one IP -- per Ingress.
     loadbalancerMode: shared
     service:
-      type: LoadBalancer
-      # Pin the shared entrypoint to a fixed address out of the CiliumLoadBalancerIPPool
-      # (see ../cilium-config/ip-pool.yaml) so ingress hostnames have a stable A record.
-      # L2 announcements ARP for it on eno1, so it is reachable on the LAN directly.
-      loadBalancerIP: 192.168.100.200
+      annotations:
+        # Pin the shared entrypoint so ingress hostnames have a stable A record. This
+        # address is the literal `start` of the CiliumLoadBalancerIPPool block in
+        # ../cilium-config/ip-pool.yaml -- keep the two in step. LB-IPAM's own
+        # annotation, rather than spec.loadBalancerIP, which k8s deprecated in 1.24.
+        lbipam.cilium.io/ips: "192.168.100.200"

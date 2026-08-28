@@ -1,7 +1,2 @@
 ansible_become_pass: "{{ vault_become_pass }}"
 repo_path: "/home/{{ ansible_user }}/dev/ai-platform"
-
-# Address the shared Cilium Ingress LoadBalancer answers on. Must be inside the
-# CiliumLoadBalancerIPPool and match ingressController.service.loadBalancerIP in
-# deployment/kube-system/cilium/values.yaml, or ArgoCD will move it back.
-ingress_lb_ip: "192.168.100.200"
