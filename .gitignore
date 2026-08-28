@@ -1,0 +1,3 @@
+# Resolved by `helm dependency update` (and by ArgoCD at sync time) -- not source.
+deployment/*/*/charts/
+deployment/*/*/Chart.lock
