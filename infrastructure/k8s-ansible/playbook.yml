@@ -177,9 +177,34 @@
       systemd:
         daemon_reload: true
 
+    # ── Cilium values ─────────────────────────────────────
+    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
+    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
+    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
+    #
+    # Read here rather than next to the Cilium install because the pod CIDR below is an
+    # argument to kubeadm as well.
+    - name: Read the ArgoCD-managed Cilium values
+      set_fact:
+        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
+
+    - name: Resolve the pinned Cilium Ingress address
+      set_fact:
+        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
+
+    # Single source of truth for the pod range. Cilium in cluster-pool mode does not
+    # read --pod-network-cidr, and kubeadm does not read clusterPoolIPv4PodCIDRList, so
+    # both have to be told -- from the same value, or they drift into the overlap
+    # values.yaml explains at length.
+    - name: Resolve the pod CIDR
+      set_fact:
+        pod_cidr: "{{ cilium_values.cilium.ipam.operator.clusterPoolIPv4PodCIDRList | first }}"
+
     # ── Cluster init ──────────────────────────────────────
+    # --pod-network-cidr must stay disjoint from --service-cluster-ip-range, left at the
+    # kubeadm default 10.96.0.0/12. Fixed at init time: changing it later needs a rebuild.
     - name: Initialize Kubernetes cluster
-      command: kubeadm init --pod-network-cidr=10.0.0.0/8 --skip-phases=addon/kube-proxy
+      command: kubeadm init --pod-network-cidr={{ pod_cidr }} --skip-phases=addon/kube-proxy
       args:
         creates: /etc/kubernetes/admin.conf
 
@@ -221,17 +246,6 @@
       args:
         creates: /usr/local/bin/cilium
 
-    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
-    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
-    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
-    - name: Read the ArgoCD-managed Cilium values
-      set_fact:
-        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
-
-    - name: Resolve the pinned Cilium Ingress address
-      set_fact:
-        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
-
     - name: Install or upgrade Cilium (bootstrap only)
       shell: |
         if cilium status --wait=false > /dev/null 2>&1; then
@@ -242,7 +256,8 @@
             --set ingressController.enabled=true \
             --set ingressController.default=true \
             --set ingressController.loadbalancerMode=shared \
-            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}'
+            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}' \
+            --set 'ipam.operator.clusterPoolIPv4PodCIDRList={{ '{' }}{{ pod_cidr }}{{ '}' }}'
         else
           cilium install --version v1.19.4 \
             --set kubeProxyReplacement=true \
@@ -251,7 +266,8 @@
             --set ingressController.enabled=true \
             --set ingressController.default=true \
             --set ingressController.loadbalancerMode=shared \
-            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}'
+            --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips={{ ingress_lb_ip }}' \
+            --set 'ipam.operator.clusterPoolIPv4PodCIDRList={{ '{' }}{{ pod_cidr }}{{ '}' }}'
         fi
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
