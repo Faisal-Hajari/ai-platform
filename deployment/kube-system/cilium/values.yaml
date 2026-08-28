@@ -1,4 +1,9 @@
 cilium:
+  # Required: with --skip-phases=addon/kube-proxy there is no kube-proxy, so nothing
+  # programs the 10.96.0.1 ClusterIP until Cilium is up. Cilium must therefore reach
+  # the API server directly or it deadlocks on itself at startup.
+  k8sServiceHost: 192.168.100.19
+  k8sServicePort: 6443
   kubeProxyReplacement: true
   l2announcements:
     enabled: true
