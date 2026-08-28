@@ -27,6 +27,40 @@ ApplicationSet from. It already defaults to `/home/{{ ansible_user }}/dev/ai-pla
 `group_vars/k8s-master/vars.yml`; pass `-e repo_path=...` only if the checkout lives
 somewhere else.
 
+## Host-specific values
+
+This cluster runs on one machine, and a few values describe *that* machine rather than
+the platform. Moving to different hardware, a different NIC or a different LAN means
+editing these — nothing discovers them at run time.
+
+| Value | Declared in | Consumed by |
+|---|---|---|
+| API server address | [`deployment/kube-system/cilium/values.yaml`](deployment/kube-system/cilium/values.yaml) (`k8sServiceHost`) | Cilium's direct dial, **and** `kubeadm init --apiserver-advertise-address` — the playbook reads this key, so both are pinned to the one value |
+| Pod CIDR | same file (`ipam.operator.clusterPoolIPv4PodCIDRList`) | Cilium's allocator **and** `kubeadm init --pod-network-cidr`, same way. Rebuild-only; see the comment there |
+| Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Must sit inside the pool below |
+| LoadBalancer pool | [`deployment/kube-system/cilium-config/ip-pool.yaml`](deployment/kube-system/cilium-config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope |
+| NIC name (`eno1`) | [`deployment/kube-system/cilium-config/l2-policy.yaml`](deployment/kube-system/cilium-config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses |
+| Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible; `repo_path` in `group_vars/` is derived from it |
+
+The API server address and the pod CIDR used to be written twice each — once for Cilium
+and once for kubeadm — and agreed only because nobody had changed one of them. They are
+now single-sourced, and the playbook asserts, before it runs `kubeadm init`, that the
+declared API server address is actually on the host **and** — once a cluster exists — that
+it is still the address that cluster was built to advertise. The second one fires on a
+re-run that looks like it should be a no-op, which is exactly when it is least expected
+and most needed: see the paragraph below for why editing this value on a live cluster is
+only half a fix.
+
+**Give the node a DHCP reservation.** Its address is currently an ordinary lease
+(`ip route show default` → `proto dhcp`), and a moved lease is expensive here. Because
+there is no kube-proxy, Cilium reaches the API server by address and cannot fall back to
+the `10.96.0.1` ClusterIP — that half is recoverable with
+[`infrastructure/scripts/recover_cilium.sh`](infrastructure/scripts/recover_cilium.sh).
+The API server's own advertise address and serving-cert SANs are fixed at `kubeadm init`,
+so that half needs the certs regenerated or the cluster rebuilt. The assert turns a moved
+lease into a clear failure at the top of the run instead of a deadlock partway through,
+but a reservation avoids the situation.
+
 ## Scripts
 
 Each script carries a shebang and is executable, so run it directly.

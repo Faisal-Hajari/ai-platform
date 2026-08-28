@@ -100,6 +100,131 @@
         success_msg: the ArgoCD deploy key is unencrypted
 
   tasks:
+    # ── Host identity ─────────────────────────────────────
+    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
+    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
+    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
+    #
+    # First in the play, ahead of everything else, because the asserts below decide
+    # whether this run can work at all. A moved DHCP lease should abort a pristine host,
+    # not one that has already had swap disabled, /etc/fstab rewritten, sysctl files
+    # dropped and kubeadm installed and held.
+    - name: Read the ArgoCD-managed Cilium values
+      set_fact:
+        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
+
+    - name: Resolve the pinned Cilium Ingress address
+      set_fact:
+        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
+
+    # Single source of truth for the pod range. Cilium in cluster-pool mode does not
+    # read --pod-network-cidr, and kubeadm does not read clusterPoolIPv4PodCIDRList, so
+    # both have to be told -- from the same value, or they drift into the overlap
+    # values.yaml explains at length.
+    - name: Resolve the pod CIDR
+      set_fact:
+        pod_cidr: "{{ cilium_values.cilium.ipam.operator.clusterPoolIPv4PodCIDRList | first }}"
+
+    # Same argument, for the API server address. Cilium dials k8sServiceHost directly --
+    # with no kube-proxy it cannot fall back to the 10.96.0.1 ClusterIP -- while kubeadm,
+    # given no --apiserver-advertise-address, picks the address on the default route.
+    # Two independent determinations that agree only by luck: the node's address is a
+    # DHCP lease, so a new lease or a second NIC changing the default route makes kubeadm
+    # advertise one address while values.yaml still names the old one. That is precisely
+    # the deadlock recover_cilium.sh exists to undo. Declare it once, feed both.
+    - name: Resolve the API server address
+      set_fact:
+        apiserver_advertise_address: "{{ cilium_values.cilium.k8sServiceHost }}"
+
+    # Not ansible_all_ipv4_addresses: that includes cilium_host, whose /32 out of the pod
+    # range is on this host and is useless as an advertise address -- accepting it would
+    # wave through exactly the deadlock these asserts exist to prevent. Filter out the
+    # interfaces Cilium and the container runtime create. Deliberately NOT narrowed to
+    # ansible_default_ipv4.address: binding a non-default NIC is a legitimate thing to
+    # want on a multi-NIC box, and this check should not forbid it.
+    - name: Resolve the NICs that could carry the API server address
+      set_fact:
+        node_lan_nics: >-
+          {{ ansible_facts['interfaces']
+             | reject('search', '^(lo$|cilium_|lxc|cni|veth|docker|flannel|kube)')
+             | map('extract', ansible_facts) | list }}
+
+    # Both ipv4 and ipv4_secondaries. Ansible files only the first non-secondary address
+    # of an interface under `ipv4`; every later one goes to `ipv4_secondaries`. Reading
+    # `ipv4` alone would reject a LAN address added alongside a DHCP lease -- a static
+    # address, a VIP, anything from `ip addr add` on a NIC that already had one -- and
+    # abort the play over an address that is on the host and perfectly usable. Failing
+    # that way round is worse than being slightly permissive: an unfiltered bridge here
+    # only matters if someone declares its address as k8sServiceHost.
+    #
+    # unique because a labelled alias (`ip addr add ... label eno1:0`) is filed twice --
+    # once on the alias entry, once appended to the parent device -- and both reach this
+    # list. Membership is unaffected either way; this is so the address list in the
+    # failure message below does not stutter at the operator reading it.
+    - name: Resolve the addresses usable as an API server advertise address
+      set_fact:
+        node_lan_addresses: >-
+          {{ ((node_lan_nics | selectattr('ipv4', 'defined') | map(attribute='ipv4.address') | list)
+              + (node_lan_nics | selectattr('ipv4_secondaries', 'defined')
+                 | map(attribute='ipv4_secondaries') | flatten
+                 | map(attribute='address') | list))
+             | unique | list }}
+
+    - name: Assert the declared API server address is on this host
+      assert:
+        that: apiserver_advertise_address in node_lan_addresses
+        fail_msg: >-
+          values.yaml declares k8sServiceHost={{ apiserver_advertise_address }}, but this
+          host's usable addresses are {{ node_lan_addresses | join(', ') }} -- most likely
+          the DHCP lease moved. Point k8sServiceHost in
+          deployment/kube-system/cilium/values.yaml at the address this node actually
+          holds, and give the node a reservation.
+        success_msg: >-
+          API server will advertise {{ apiserver_advertise_address }}, which this host holds
+
+    # The assert above is the right question only before kubeadm init. Afterwards the
+    # invariant is not "the declared address is on this host" but "the declared address is
+    # the one the cluster was built to advertise" -- and those come apart in the second
+    # half of the very scenario the message above describes. Move the lease, edit
+    # k8sServiceHost as instructed, and the address is now on the host, so the assert above
+    # goes green; but kubeadm init is skipped by its `creates:` guard, so the API server
+    # still advertises the old address with SANs to match, and the run fails later as a
+    # confusing kubectl error instead of a named assert.
+    - name: Read the kubeconfig of an existing cluster
+      slurp:
+        src: /etc/kubernetes/admin.conf
+      register: admin_conf
+      failed_when: false
+
+    # Parsed in its own task, not inline in fail_msg below: assert finalizes fail_msg on
+    # every run, pass or fail, so an expression that can raise there breaks runs that were
+    # about to succeed. from_yaml can still raise here, on an admin.conf that exists but is
+    # truncated -- deliberately left to fail, because unlike the fail_msg case it only
+    # fires when the file really is broken, and the error names the file and the line.
+    #
+    # admin.conf is a proxy: what has to match is the API server's --advertise-address and
+    # its serving-cert SANs, which this only records as they were at init. They can be
+    # desynced by hand-editing admin.conf, though the recovery for a moved lease
+    # (kubeadm init phase certs apiserver, then phase kubeconfig admin) rewrites both.
+    - name: Resolve the address the existing cluster was built to advertise
+      set_fact:
+        built_apiserver_host: >-
+          {{ (admin_conf.content | b64decode | from_yaml).clusters[0].cluster.server
+             | urlsplit('hostname') }}
+      when: admin_conf.content is defined
+
+    - name: Assert the existing cluster already advertises the declared address
+      assert:
+        that: built_apiserver_host == apiserver_advertise_address
+        fail_msg: >-
+          This cluster was built advertising {{ built_apiserver_host }}, but values.yaml
+          now declares k8sServiceHost={{ apiserver_advertise_address }}. The advertise
+          address and the serving-cert SANs were fixed at kubeadm init, so editing
+          values.yaml fixes only Cilium's half -- regenerate the certs or rebuild.
+        success_msg: >-
+          Existing cluster already advertises {{ apiserver_advertise_address }}
+      when: admin_conf.content is defined
+
     # ── Swap ──────────────────────────────────────────────
     # swapoff -a is unconditional, so on its own it reports a change on every run for the
     # rest of the cluster's life -- long after `Remove swap from fstab` below made sure
@@ -352,34 +477,15 @@
       systemd:
         daemon_reload: true
 
-    # ── Cilium values ─────────────────────────────────────
-    # Read straight out of the ArgoCD-managed values so the bootstrap install and the
-    # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
-    # for: when the two drift, ArgoCD reconciles Cilium's own settings away.
-    #
-    # Read here rather than next to the Cilium install because the pod CIDR below is an
-    # argument to kubeadm as well.
-    - name: Read the ArgoCD-managed Cilium values
-      set_fact:
-        cilium_values: "{{ lookup('file', repo_path + '/deployment/kube-system/cilium/values.yaml') | from_yaml }}"
-
-    - name: Resolve the pinned Cilium Ingress address
-      set_fact:
-        ingress_lb_ip: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
-
-    # Single source of truth for the pod range. Cilium in cluster-pool mode does not
-    # read --pod-network-cidr, and kubeadm does not read clusterPoolIPv4PodCIDRList, so
-    # both have to be told -- from the same value, or they drift into the overlap
-    # values.yaml explains at length.
-    - name: Resolve the pod CIDR
-      set_fact:
-        pod_cidr: "{{ cilium_values.cilium.ipam.operator.clusterPoolIPv4PodCIDRList | first }}"
-
     # ── Cluster init ──────────────────────────────────────
     # --pod-network-cidr must stay disjoint from --service-cluster-ip-range, left at the
     # kubeadm default 10.96.0.0/12. Fixed at init time: changing it later needs a rebuild.
     - name: Initialize Kubernetes cluster
-      command: kubeadm init --pod-network-cidr={{ pod_cidr }} --skip-phases=addon/kube-proxy
+      command: >-
+        kubeadm init
+        --apiserver-advertise-address={{ apiserver_advertise_address }}
+        --pod-network-cidr={{ pod_cidr }}
+        --skip-phases=addon/kube-proxy
       args:
         creates: /etc/kubernetes/admin.conf
 
