@@ -565,12 +565,23 @@
     # line: a PEM key spliced into a YAML block scalar has to be re-indented to match, and
     # getting that wrong yields a well-formed Secret holding a corrupt key.
     - name: Register the ArgoCD repository credential
-      # OpenSSH rejects a key that does not end in a newline, and a key round-tripped
-      # through the vault easily loses it. Normalising has to happen in a double-quoted
-      # YAML scalar, where \n is a newline -- written inside the literal block below it
-      # stays two characters, which produces exactly the corrupt key described above.
+      # Two line-ending accidents, both of which yield a well-formed Secret holding a key
+      # OpenSSH will not load, and neither of which any assert above can see. A key that has
+      # been through a Windows editor keeps its CRs -- the delimiters still match and the
+      # cipher name still sits inside the first base64 line, so it passes everything. And a
+      # key round-tripped through the vault easily loses its final newline, which OpenSSH
+      # also requires. splitlines/join fixes the first and re-terminates the second; a CRLF
+      # key is a correct key that survived a lossy paste, so normalise it rather than
+      # rejecting it.
+      #
+      # Not replace('\r', ''): Jinja normalises newlines inside its own string literals, so
+      # that escape becomes '\n' before the filter runs and it deletes the key's line breaks
+      # instead of its carriage returns -- 7 lines to 1, still 6 CRs. In a single-quoted YAML
+      # scalar it is a silent no-op instead. splitlines() never spells the escape. The
+      # trailing "\n" below is safe for the opposite reason: YAML resolves it before Jinja
+      # sees it, where inside a literal block it would stay two characters.
       vars:
-        deploy_key_pem: "{{ argocd_deploy_key | trim }}\n"
+        deploy_key_pem: "{{ argocd_deploy_key.splitlines() | join('\n') | trim }}\n"
       command: >
         kubectl apply --server-side --force-conflicts -f -
         -o jsonpath={.metadata.resourceVersion}
