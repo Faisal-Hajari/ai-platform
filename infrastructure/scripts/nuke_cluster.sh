@@ -8,6 +8,23 @@ kubeadm reset -f
 
 rm -rf /etc/cni/net.d
 rm -rf /etc/kubernetes
+
+# kubeadm reset explicitly leaves CNI-created interfaces and any state outside
+# /etc/kubernetes alone, so Cilium's node-local state outlives the nuke: cilium_host
+# keeps the old router IP (and its /24 route), cilium_vxlan the old tunnel, and
+# /var/run/cilium + /var/lib/cilium the endpoint and IPAM state keyed to the old pool.
+#
+# That was harmless while the pod CIDR never changed. It is not once it does: on the
+# first rebuild onto a new pool the restored router IP sits outside the new allocation
+# CIDR. The agent is supposed to notice and discard it; clearing the state outright
+# means not depending on that on the one run where rollback is hardest.
+#
+# cilium_net is cilium_host's veth peer and goes with it. Per-endpoint lxc* veths go
+# with their containers.
+ip link del cilium_host 2>/dev/null || true
+ip link del cilium_vxlan 2>/dev/null || true
+rm -rf /var/run/cilium /var/lib/cilium
+
 # Run as root via sudo, so ~ is /root -- that misses the invoking user's config,
 # the one the playbook installs. Both are stale after a nuke: root's if the
 # operator did the kubeadm post-init copy so `sudo kubectl` works, the user's
