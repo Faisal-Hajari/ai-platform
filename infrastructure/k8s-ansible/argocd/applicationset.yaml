@@ -6,6 +6,13 @@ metadata:
 spec:
   generators:
     - git:
+        # ArgoCD cannot clone an SSH remote without a repository credential in its own
+        # namespace. The playbook registers one from the vault ("Register the ArgoCD
+        # repository credential" in playbook.yml), reading this URL back out of this file
+        # so the credential and the remote cannot drift apart -- ArgoCD matches credentials
+        # to repositories by URL, so a mismatch is not an error, it is a silent no-op.
+        # Both URLs below have to stay identical for the same reason; the playbook asserts
+        # that they are.
         repoURL: git@github.com:Faisal-Hajari/ai-platform.git
         revision: main
         directories:

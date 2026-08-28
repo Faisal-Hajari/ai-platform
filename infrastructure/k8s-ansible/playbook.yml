@@ -437,11 +437,127 @@
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
 
+    # ── ArgoCD repository credential ──────────────────────
+    # The generator in argocd/applicationset.yaml is an SSH remote, and ArgoCD cannot clone
+    # one without a repository credential in its own namespace. Nothing here used to create
+    # it: the live cluster's credential had been made by hand, so a fresh machine ran this
+    # play to completion, reported success, created the ApplicationSet -- and then synced
+    # nothing, the clone failure surfacing only as repo-server errors in the ArgoCD UI.
+    #
+    # ArgoCD pairs a credential to a repository by URL, so a credential registered for a
+    # URL the ApplicationSet does not use is not an error, it is a silent no-op -- the very
+    # failure this task exists to end. Read the URL back out of the ApplicationSet rather
+    # than restating it here, the same way the Cilium install above reads its values out of
+    # the manifest ArgoCD will later reconcile against.
+    - name: Read the deployment repository URL from the ApplicationSet
+      set_fact:
+        argocd_appset: "{{ lookup('file', repo_path + '/infrastructure/k8s-ansible/argocd/applicationset.yaml') | from_yaml }}"
+
+    - name: Assert the ApplicationSet clones one repository
+      assert:
+        that:
+          - argocd_appset.spec.generators[0].git.repoURL == argocd_appset.spec.template.spec.source.repoURL
+        fail_msg: >-
+          The ApplicationSet generator clones
+          {{ argocd_appset.spec.generators[0].git.repoURL }} while its template deploys from
+          {{ argocd_appset.spec.template.spec.source.repoURL }}. Only the first gets a
+          credential below, so the generated Applications would all fail to sync.
+        success_msg: "the ApplicationSet clones {{ argocd_appset.spec.generators[0].git.repoURL }}"
+
+    - name: Assert the ArgoCD deploy key is in the vault
+      assert:
+        that: argocd_deploy_key | length > 0
+        fail_msg: >-
+          vault_argocd_deploy_key is missing from group_vars/k8s-master/vault.yml. ArgoCD
+          needs the private half of a GitHub deploy key with read access to this repo;
+          generate one with `ssh-keygen -t ed25519 -C argocd -f argocd_deploy_key`, add the
+          public half under the repo's Deploy keys on GitHub, then put the private half in
+          the vault with `ansible-vault edit group_vars/k8s-master/vault.yml`.
+        success_msg: the ArgoCD deploy key is present
+
+    # Passed on stdin, so the key never reaches the argument list of a process on the node
+    # and never lands on disk. `data` rather than `stringData` because a base64 blob is one
+    # line: a PEM key spliced into a YAML block scalar has to be re-indented to match, and
+    # getting that wrong yields a well-formed Secret holding a corrupt key.
+    - name: Register the ArgoCD repository credential
+      # OpenSSH rejects a key that does not end in a newline, and a key round-tripped
+      # through the vault easily loses it. Normalising has to happen in a double-quoted
+      # YAML scalar, where \n is a newline -- written inside the literal block below it
+      # stays two characters, which produces exactly the corrupt key described above.
+      vars:
+        deploy_key_pem: "{{ argocd_deploy_key | trim }}\n"
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: repo-ai-platform
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          type: Opaque
+          data:
+            type: {{ 'git' | b64encode }}
+            url: {{ argocd_appset.spec.generators[0].git.repoURL | b64encode }}
+            sshPrivateKey: {{ deploy_key_pem | b64encode }}
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      register: argocd_repo_secret
+      changed_when: "'unchanged' not in argocd_repo_secret.stdout"
+      # Without this the key is echoed back in the task's module arguments on any failure.
+      # It costs the diagnostics for this one task; the assert at the end of this section
+      # is what reports an unusable credential, and it reads ArgoCD's own error.
+      no_log: true
+
     - name: Apply ArgoCD ApplicationSet
       command: kubectl apply -f {{ repo_path }}/infrastructure/k8s-ansible/argocd/applicationset.yaml
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
+
+    # Applying the ApplicationSet only records the object; whether ArgoCD can actually
+    # clone the repo behind it is decided afterwards, by the applicationset controller. The
+    # credential registered above is necessary for that but not sufficient -- a deploy key
+    # revoked on GitHub, granted to the wrong repo, or pasted in truncated all produce a
+    # perfectly valid Secret and a repo ArgoCD still cannot read. That is the same silent
+    # green run as before, just one step further along, so do not infer success from having
+    # applied the manifests. Take the verdict from the controller instead: it reports
+    # ResourcesUpToDate once it has resolved the generator, and forces it false whenever a
+    # generator errors.
+    - name: Wait for the ApplicationSet to resolve its generator
+      command: >
+        kubectl wait --for=condition=ResourcesUpToDate applicationset/deployment-appset
+        -n argocd --timeout=120s
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      register: appset_ready
+      changed_when: false
+      failed_when: false
+
+    # kubectl wait reports only that it timed out; the reason sits in the conditions.
+    - name: Read the ApplicationSet conditions
+      command: >
+        kubectl get applicationset deployment-appset -n argocd
+        -o jsonpath={.status.conditions}
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      when: appset_ready.rc != 0
+      register: appset_conditions
+      changed_when: false
+      failed_when: false
+
+    - name: Assert ArgoCD can reach the deployment repository
+      assert:
+        that: appset_ready.rc == 0
+        fail_msg: >-
+          deployment-appset never reported ResourcesUpToDate, so ArgoCD is generating no
+          Applications and nothing under deployment/ will sync:
+          {{ appset_conditions.stdout | default('', true) or appset_ready.stderr }}
+        success_msg: ArgoCD has resolved the deployment repository
 
     # ── Helm ──────────────────────────────────────────────
     # The release tarball, not get-helm-3 from the branch tip: that script was unpinned,
