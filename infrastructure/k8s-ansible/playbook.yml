@@ -726,9 +726,19 @@
     # ingressController in values.yaml. The step below proves LB-IPAM handed the shared
     # entrypoint an address; it says nothing about whether anything is listening behind it.
     #
-    # `kubectl rollout status` hard-errors on an OnDelete update strategy rather than
-    # returning. All three render RollingUpdate today; setting updateStrategy in
-    # values.yaml would break this task, not merely slow it.
+    # Two ways a values.yaml edit breaks this task rather than slowing it, both worth
+    # knowing before making one. `kubectl rollout status` hard-errors on an OnDelete
+    # update strategy rather than returning, and all three render RollingUpdate today --
+    # so setting updateStrategy breaks it. And ds/cilium-envoy exists only while
+    # envoy.enabled is true, which values.yaml never states: it rides the upstream default
+    # (true in 1.19), so a cilium version bump in Chart.yaml that flipped that default
+    # would fail here under `set -eu` with a bare NotFound, reading as a broken cluster
+    # rather than as a chart that changed shape. That is the likelier of the two, since
+    # bumping the pinned dependency is ordinary and setting updateStrategy is not.
+    #
+    # Pinning envoy.enabled: true in values.yaml would state the dependency where it
+    # belongs, but it would also quietly override whatever a future chart's default comes
+    # to mean. Left documented instead.
     - name: Wait for the Cilium datapath
       shell: |
         set -eu
