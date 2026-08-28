@@ -3,6 +3,16 @@ cilium:
   # programs the 10.96.0.1 ClusterIP until Cilium is up. Cilium must therefore reach
   # the API server directly or it deadlocks on itself at startup.
   k8sServiceHost: 192.168.100.19
+  # Also `kubeadm init --apiserver-advertise-address`: the playbook reads k8sServiceHost
+  # for it, so kubeadm and Cilium cannot name different addresses. See the host-identity
+  # block at the top of infrastructure/k8s-ansible/playbook.yml, which asserts this
+  # address is on the node -- and, once a cluster exists, that it is the one the cluster
+  # was built to advertise.
+  #
+  # The port is the same shape of duplication, left alone: kubeadm gets no
+  # --apiserver-bind-port and defaults to 6443, which is what this declares. They agree by
+  # shared default rather than by luck, and a port does not move the way a DHCP lease
+  # does -- but do not "fix" one of them alone.
   k8sServicePort: 6443
   kubeProxyReplacement: true
 
