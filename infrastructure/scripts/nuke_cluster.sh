@@ -8,7 +8,12 @@ kubeadm reset -f
 
 rm -rf /etc/cni/net.d
 rm -rf /etc/kubernetes
-rm -rf ~/.kube
+# Run as root via sudo, so ~ is /root -- resolve the invoking user's real home
+# instead, otherwise their kubeconfig survives the nuke with credentials for a
+# cluster that no longer exists.
+NUKE_USER=${SUDO_USER:-$USER}
+NUKE_HOME=$(getent passwd "$NUKE_USER" | cut -d: -f6)
+rm -rf "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
 
 systemctl restart containerd
 
