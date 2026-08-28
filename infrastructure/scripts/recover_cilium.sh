@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Recovers a cluster where Cilium is stuck dialing https://10.96.0.1:443 and CrashLooping.
 #
 # Because kubeadm runs with --skip-phases=addon/kube-proxy, nothing programs the

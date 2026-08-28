@@ -101,8 +101,14 @@
 
   tasks:
     # ── Swap ──────────────────────────────────────────────
+    # swapoff -a is unconditional, so on its own it reports a change on every run for the
+    # rest of the cluster's life -- long after `Remove swap from fstab` below made sure
+    # there is nothing left to turn off. Gate it on the fact instead of silencing it with
+    # `changed_when: false`: a node that really does come up with swap on is a change,
+    # and should still be reported as one.
     - name: Disable swap
       command: swapoff -a
+      when: ansible_facts['swaptotal_mb'] | default(0) | int > 0
 
     - name: Remove swap from fstab
       replace:
@@ -184,6 +190,18 @@
         replace: 'SystemdCgroup = true'
       notify: restart containerd
 
+    # Neither config this play normally sees reaches here with anything to match.
+    # `containerd config default` output enables CRI and has no disabled_plugins line at
+    # all; the Ubuntu package's stub does ship `disabled_plugins = ["cri"]`, but it has no
+    # SystemdCgroup either, so the guard above is true against it and generation has
+    # already overwritten it by the time this task runs. Generation is skipped only when
+    # the config already has SystemdCgroup, which by definition means it is not the stub.
+    #
+    # What is left is the case worth keeping the task for: a config that is neither --
+    # hand-rolled, or carried across an upgrade -- holding SystemdCgroup and a live
+    # `disabled_plugins = ["cri"]` at once. containerd would come up with no CRI service
+    # for kubelet to talk to, and the assert below would not catch it, because it only
+    # reads the cgroup driver.
     - name: Enable CRI plugin in containerd config
       replace:
         path: /etc/containerd/config.toml
@@ -502,13 +520,36 @@
       register: argocd_ns
       failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
 
+    # --server-side, but deliberately not --force-conflicts. The manifest is re-applied
+    # on every run, so --force-conflicts is not a one-off override: it standingly takes
+    # ownership of any field another manager has set since -- an operator, a hand patch,
+    # a chart layered on top -- and reverts it silently on the next run. A conflict is
+    # the useful signal that something outside this playbook is managing part of ArgoCD,
+    # so let it stop the run and be resolved deliberately. The field manager is left at
+    # kubectl's default so this keeps ownership of the fields the earlier forced applies
+    # already claimed.
     - name: Install ArgoCD
       command: >
-        kubectl apply -n argocd --server-side --force-conflicts
+        kubectl apply -n argocd --server-side
         -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
+      register: argocd_install
+      failed_when: false
+
+    # Deferred to an assert so the failure this play now allows arrives with the reason
+    # attached, instead of a raw server-side-apply conflict dump from kubectl.
+    - name: Assert the ArgoCD apply succeeded
+      assert:
+        that: argocd_install.rc == 0
+        fail_msg: >-
+          kubectl apply failed for ArgoCD. If it reported a conflict, a field manager
+          other than kubectl owns part of the pinned manifest -- something outside this
+          playbook is managing ArgoCD. Settle that deliberately (take the field back, or
+          stop managing it elsewhere); re-adding --force-conflicts would only revert it
+          silently on every run. kubectl said: {{ argocd_install.stderr | default('') | trim }}
+        success_msg: ArgoCD applied with no field-ownership conflicts
 
     # argocd-server is not what the gate at the end of this section asks about: the
     # applicationset controller has to reconcile the ApplicationSet and repo-server does the

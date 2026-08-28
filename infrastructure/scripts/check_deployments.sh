@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Renders every chart under deployment/ the way ArgoCD will and asserts the
 # invariants that have bitten this cluster before. Run before pushing changes
 # to deployment/ -- a bad value here is accepted silently and only shows up

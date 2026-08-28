@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Recovers a static pod stuck in CreateContainerError with "failed to reserve container
 # name ... is reserved for <id>", while the container it represents is still running and
 # serving normally.
@@ -28,7 +29,7 @@ set -euo pipefail
 
 NAME=${1:-kube-apiserver}
 
-command -v crictl >/dev/null || { echo "crictl not found -- see nuke_cluster.sh header"; exit 1; }
+command -v crictl >/dev/null || { echo "crictl not found -- see README.md"; exit 1; }
 
 # Every container object by this name, running or not: the live one and the orphan that
 # holds the reservation.

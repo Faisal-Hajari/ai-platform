@@ -1,8 +1,23 @@
-# you might need to install crictl
-# VERSION="v1.31.1"
-# wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
-# sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
-# rm -f crictl-$VERSION-linux-amd64.tar.gz
+#!/usr/bin/env bash
+# Tears a single-node cluster down far enough that the playbook can rebuild it.
+#
+# Usage: sudo ./nuke_cluster.sh
+#
+# set -e matters here: every rm below assumes the reset above it succeeded. Without it a
+# failed `kubeadm reset` -- a CRI it cannot reach, a mount it cannot release -- is
+# followed by the deletion of /etc/kubernetes anyway, which throws away the PKI and the
+# static pod manifests needed to diagnose it and leaves a node that neither runs nor
+# rebuilds cleanly.
+set -euo pipefail
+
+# kubeadm reset drives the CRI through the crictl binary, so a missing crictl means the
+# reset leaves every container running while reporting success. Checked before anything
+# is destroyed rather than after: this is the one failure that is cheap while the node is
+# still intact. See README.md for the cri-tools install.
+command -v crictl >/dev/null || {
+  echo "crictl not found -- kubeadm reset needs it to stop containers. See README.md." >&2
+  exit 1
+}
 
 kubeadm reset -f
 
@@ -59,10 +74,10 @@ rm -rf --one-file-system /var/run/cilium /var/lib/cilium
 #
 # find, not a `cilium_*` glob: under zsh an unmatched glob is a fatal error for the
 # command rather than a literal passed through as it is in bash, so the cleanup would be
-# skipped on exactly the runs where the directory is already clean. That bites only when
-# this file is handed to zsh explicitly (`sudo zsh nuke_cluster.sh`) -- running it as a
-# program is unaffected, since a no-shebang file fails execve with ENOEXEC and the
-# caller falls back to /bin/sh (dash here), not to itself. Narrow, but free to avoid.
+# skipped on exactly the runs where the directory is already clean. The shebang settles
+# that for running this as a program, but naming an interpreter on the command line
+# overrides it, so `sudo zsh nuke_cluster.sh` still reaches zsh. Narrow, but free to
+# avoid.
 find /sys/fs/bpf/tc/globals -maxdepth 1 -name 'cilium_*' -exec rm -rf {} + 2>/dev/null || true
 rm -rf /sys/fs/bpf/cilium
 
@@ -71,8 +86,10 @@ rm -rf /sys/fs/bpf/cilium
 # operator did the kubeadm post-init copy so `sudo kubectl` works, the user's
 # from playbook.yml. Drop both, otherwise a rebuild yields x509 errors against
 # the new CA that look unrelated to the reset.
-NUKE_USER=${SUDO_USER:-$USER}
-NUKE_HOME=$(getent passwd "$NUKE_USER" | cut -d: -f6)
+NUKE_USER=${SUDO_USER:-$(id -un)}
+# `|| true` so an unresolvable user reaches the `:?` below with its own message rather
+# than exiting on getent's status under `set -o pipefail`.
+NUKE_HOME=$(getent passwd "$NUKE_USER" | cut -d: -f6 || true)
 rm -rf /root/.kube
 rm -rf "${NUKE_HOME:?unable to resolve home for $NUKE_USER}/.kube"
 
