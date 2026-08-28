@@ -15,6 +15,12 @@ cd "$(dirname "$0")/../.."
 
 fail=0
 
+# The cross-file check after the loop asserts against the render, not against
+# values.yaml, so it needs the cilium chart's output to outlive the iteration that
+# produced it -- `render` is overwritten by every chart after it.
+ingress_render=$(mktemp)
+trap 'rm -f "$ingress_render"' EXIT
+
 for chart in deployment/*/*/Chart.yaml; do
   dir=$(dirname "$chart")
   # Per-chart. `fail` used to be the only flag and was never reset, so once any chart
@@ -51,6 +57,7 @@ PY
       echo "    FAIL: no KUBERNETES_SERVICE_HOST in the render -- set cilium.k8sServiceHost"
       chart_fail=1
     fi
+    printf '%s\n' "$render" >"$ingress_render"
   fi
 
   if [ "$chart_fail" -eq 0 ]; then
@@ -72,17 +79,18 @@ done
 # room, so the condition just persists. Both halves are static YAML, so assert
 # containment here instead of learning it from the cluster (#26).
 echo "==> deployment/kube-system/cilium-config"
-if pool_errors=$(python3 - 2>&1 <<'PY'
-import ipaddress, pathlib, sys, yaml
+if pool_errors=$(INGRESS_RENDER="$ingress_render" python3 - 2>&1 <<'PY'
+import ipaddress, os, pathlib, sys, yaml
 
 values = pathlib.Path("deployment/kube-system/cilium/values.yaml")
 pool_dir = pathlib.Path("deployment/kube-system/cilium-config")
+render = pathlib.Path(os.environ["INGRESS_RENDER"])
 
 errors = []
 blocks = []   # (label, first, last) for every block that could serve the ingress
 skipped = []  # pools deliberately not counted, and why
 
-def parse_block(name, block):
+def parse_block(name, block, allow_first_last):
     """(label, first address, last address), or ValueError if the block is malformed."""
     if "cidr" in block:
         # strict=False because that is what LB-IPAM does: it normalizes a host address
@@ -90,7 +98,15 @@ def parse_block(name, block):
         # .192-.207 (#8). Checking the literal string instead would call a pin inside
         # the pool when it is only inside the range someone meant to write.
         net = ipaddress.ip_network(block["cidr"], strict=False)
-        return f"{name}: {block['cidr']}", net[0], net[-1]
+        first, last = net[0], net[-1]
+        # allowFirstLastIPs: "No" withholds the network and broadcast addresses, so a
+        # pin on either renders fine and is then never servable -- the same shape as a
+        # disabled pool. A /31 or /32 has nothing left after that narrowing and LB-IPAM
+        # hands both addresses out regardless, so leave those alone.
+        host_bits = net.max_prefixlen - net.prefixlen
+        if not allow_first_last and host_bits > 1:
+            first, last = net[1], net[-2]
+        return f"{name}: {block['cidr']}", first, last
     first, last = ipaddress.ip_address(block["start"]), ipaddress.ip_address(block["stop"])
     if last < first:
         raise ValueError(f"stop {last} precedes start {first}")
@@ -116,37 +132,59 @@ for path in sorted(pool_dir.glob("*.y*ml")):
         # so rather than guess at a match, refuse to count the pool and name it in the
         # failure. Both directions stay closed: an unservable pool cannot satisfy the
         # check, and an operator who meant it to serve the ingress is told why it did
-        # not count.
+        # not count. An empty selector is Cilium's match-all, so it is not a narrowing.
         if spec.get("disabled"):
             skipped.append(f"{name} (disabled)")
             continue
         if spec.get("serviceSelector"):
             skipped.append(f"{name} (serviceSelector, not evaluated)")
             continue
+        # Quoted "No" arrives as a string, bare No as False -- the field is a string
+        # enum, but nothing stops the YAML from being written either way.
+        allow_first_last = str(spec.get("allowFirstLastIPs", "Yes")).lower() not in ("no", "false")
         for index, block in enumerate(spec.get("blocks") or []):
             try:
-                blocks.append(parse_block(name, block))
+                blocks.append(parse_block(name, block, allow_first_last))
             except (KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{name} block {index} is malformed ({exc}): {block!r}")
 
+# The pin comes out of the render rather than out of values.yaml, because a pin is only
+# real if the Service carrying it is emitted at all: with ingressController.enabled
+# false the annotation still reads perfectly and there is no shared entrypoint behind
+# it. Match on kind and name, not namespace -- a bare `helm template` puts the Service
+# in default, while ArgoCD applies it to kube-system.
+pin = None
 try:
-    service = (((yaml.safe_load(values.read_text()) or {}).get("cilium") or {})
-               .get("ingressController") or {}).get("service") or {}
-    pin = (service.get("annotations") or {}).get("lbipam.cilium.io/ips")
-except (OSError, yaml.YAMLError, AttributeError) as exc:
-    errors.append(f"{values} could not be read: {exc}")
-    pin = None
+    docs = [d for d in yaml.safe_load_all(render.read_text()) if isinstance(d, dict)]
+except (OSError, yaml.YAMLError) as exc:
+    docs = []
+    errors.append(f"the cilium render could not be read: {exc}")
+services = [d for d in docs
+            if d.get("kind") == "Service"
+            and (d.get("metadata") or {}).get("name") == "cilium-ingress"]
+if not docs:
+    errors.append("the cilium chart rendered nothing -- deployment/kube-system/cilium is"
+                  " where the ingress Service comes from")
+elif not services:
+    errors.append("the cilium render has no cilium-ingress Service, so nothing carries the"
+                  f" pin -- check cilium.ingressController.enabled in {values}")
+else:
+    annotations = {}
+    for service in services:
+        annotations.update((service.get("metadata") or {}).get("annotations") or {})
+    pin = annotations.get("lbipam.cilium.io/ips")
+    if not pin:
+        # Not merely cosmetic, and not a vacuous pass to skip over: unpinned, the shared
+        # entrypoint takes whatever LB-IPAM hands out and the ingress A records rot. A
+        # misspelled annotation key looks exactly like this, and Kubernetes accepts it.
+        errors.append("the rendered cilium-ingress Service carries no lbipam.cilium.io/ips"
+                      f" -- set it in {values}")
 
 if not blocks:
     detail = f" (skipped {', '.join(skipped)})" if skipped else ""
     errors.append(f"no usable CiliumLoadBalancerIPPool block found under {pool_dir}{detail}")
-if not pin:
-    # Not merely cosmetic, and not a vacuous pass to skip over: unpinned, the shared
-    # entrypoint takes whatever LB-IPAM hands out and the ingress A records rot. A
-    # misspelled annotation key looks exactly like this, and Kubernetes accepts it.
-    errors.append(f"no lbipam.cilium.io/ips on the ingress service in {values}")
 
-for text in (pin or "").split(","):
+for text in str(pin or "").split(","):
     text = text.strip()
     if not text:
         continue
@@ -160,7 +198,7 @@ for text in (pin or "").split(","):
     # pool that does not exist on top of it just buries the reason.
     if blocks and not any(first.version == ip.version and first <= ip <= last for _, first, last in blocks):
         detail = f"; skipped {', '.join(skipped)}" if skipped else ""
-        spelled = ", ".join(label for label, _, _ in blocks) or "none"
+        spelled = ", ".join(label for label, _, _ in blocks)
         errors.append(f"ingress pin {ip} is outside every pool block that can serve it"
                       f" ({spelled}){detail}")
 
