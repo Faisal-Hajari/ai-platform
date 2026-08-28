@@ -3,6 +3,23 @@
   hosts: k8s-cluster
   become: true
 
+  # Kubernetes, Cilium and ArgoCD are pinned inline below; the two tools that are
+  # fetched as binaries rather than from a signed apt repo are pinned here, each with
+  # the SHA256 of the release artefact itself. A checksum published beside the download
+  # only proves the bytes arrived intact -- it says nothing about which version a run
+  # picked, so resolving the version at runtime (from a branch tip, as this used to do)
+  # meant two nodes bootstrapped weeks apart got different tooling. Bumping a version
+  # here means replacing its checksums too: they are per version and per architecture.
+  vars:
+    cilium_cli_version: v0.19.7
+    cilium_cli_sha256:
+      amd64: cd15e0983bf0acc7946cd05d453d1e58376ea92dec2642e745212df2b07d8852
+      arm64: 9482937f14061fb239f2dbb2f97f4103de1b101f5d5defbff319f294f9bd540f
+    helm_version: v3.21.4
+    helm_sha256:
+      amd64: 61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
+      arm64: b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a5fd3b85a7
+
   tasks:
     # ── Swap ──────────────────────────────────────────────
     - name: Disable swap
@@ -270,17 +287,70 @@
       failed_when: false
 
     # ── Cilium CNI ────────────────────────────────────────
-    - name: Download and install Cilium CLI
-      shell: |
-        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
-        CLI_ARCH=amd64
-        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
-        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
-        tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
-        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-      args:
-        creates: /usr/local/bin/cilium
+    # A missing key leaves this undefined rather than raising, so the assert below can
+    # say which architecture had no pinned checksum instead of failing inside Jinja.
+    - name: Resolve the release architecture
+      set_fact:
+        release_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] | default('') }}"
+
+    - name: Assert the architecture has pinned checksums
+      assert:
+        that: release_arch != ''
+        fail_msg: >-
+          No pinned Cilium CLI or Helm checksums for {{ ansible_facts['architecture'] }};
+          add them to the vars at the top of this play.
+        success_msg: "pinning {{ release_arch }} artefacts"
+
+    # `creates:` would keep whatever version a node happened to install first, so gate on
+    # the version the binary reports instead: bumping the pin above then actually upgrades
+    # it. `cilium version --client` exits non-zero when the CLI is absent, which reads as
+    # "not the pinned version" and installs it.
+    - name: Check the installed Cilium CLI version
+      command: cilium version --client
+      register: cilium_cli_installed
+      changed_when: false
+      failed_when: false
+
+    # Unpacked as root, so not through a predictable path in a world-writable /tmp.
+    - name: Create a scratch directory for the Cilium CLI download
+      tempfile:
+        state: directory
+        suffix: cilium-cli
+      register: cilium_cli_tmp
+      when: cilium_cli_version not in cilium_cli_installed.stdout
+
+    # get_url checks the checksum before the file lands, so a mismatch fails the task
+    # rather than leaving an unverified archive for the next task to unpack.
+    - name: Download the pinned Cilium CLI
+      get_url:
+        url: >-
+          https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ release_arch }}.tar.gz
+        dest: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
+        checksum: sha256:{{ cilium_cli_sha256[release_arch] }}
+        mode: '0644'
+      when: cilium_cli_version not in cilium_cli_installed.stdout
+
+    # No mode here: unarchive would apply it to /usr/local/bin itself, which Ubuntu ships
+    # as 2775 root:staff. The binary's own mode is set below.
+    - name: Install the Cilium CLI
+      unarchive:
+        src: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+      when: cilium_cli_version not in cilium_cli_installed.stdout
+
+    - name: Remove the Cilium CLI scratch directory
+      file:
+        path: "{{ cilium_cli_tmp.path }}"
+        state: absent
+      when: cilium_cli_tmp.path is defined
+
+    - name: Ensure the Cilium CLI is executable
+      file:
+        path: /usr/local/bin/cilium
+        owner: root
+        group: root
+        mode: '0755'
 
     # Read straight out of the ArgoCD-managed values so the bootstrap install and the
     # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
@@ -350,16 +420,53 @@
       become: false
 
     # ── Helm ──────────────────────────────────────────────
-    - name: Download Helm install script
-      get_url:
-        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-        dest: /tmp/get-helm-3.sh
-        mode: '0755'
+    # The release tarball, not get-helm-3 from the branch tip: that script was unpinned,
+    # unverified, and ran as root -- and it resolves its own version at runtime anyway.
+    - name: Check the installed Helm version
+      command: helm version --short
+      register: helm_installed
+      changed_when: false
+      failed_when: false
 
-    - name: Install Helm
-      command: /tmp/get-helm-3.sh
-      args:
-        creates: /usr/local/bin/helm
+    - name: Create a scratch directory for the Helm download
+      tempfile:
+        state: directory
+        suffix: helm
+      register: helm_tmp
+      when: helm_version not in helm_installed.stdout
+
+    - name: Download the pinned Helm release
+      get_url:
+        url: https://get.helm.sh/helm-{{ helm_version }}-linux-{{ release_arch }}.tar.gz
+        dest: "{{ helm_tmp.path }}/helm.tar.gz"
+        checksum: sha256:{{ helm_sha256[release_arch] }}
+        mode: '0644'
+      when: helm_version not in helm_installed.stdout
+
+    # Unpacked to the scratch directory rather than straight into /usr/local/bin because
+    # the tarball carries its LICENSE and README alongside the binary.
+    - name: Unpack Helm
+      unarchive:
+        src: "{{ helm_tmp.path }}/helm.tar.gz"
+        dest: "{{ helm_tmp.path }}"
+        remote_src: true
+      when: helm_version not in helm_installed.stdout
+
+    - name: Install the Helm binary
+      copy:
+        src: "{{ helm_tmp.path }}/linux-{{ release_arch }}/helm"
+        dest: /usr/local/bin/helm
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+      when: helm_version not in helm_installed.stdout
+
+    - name: Remove the Helm scratch directory
+      file:
+        path: "{{ helm_tmp.path }}"
+        state: absent
+      when: helm_tmp.path is defined
 
   handlers:
     - name: restart containerd
