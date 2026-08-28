@@ -507,12 +507,56 @@
         mode: '0600'
     
     # ── Remove control-plane taint ─────────────────────────── (You should not do this for serious clusters)
+    # This taint is what makes the only node schedulable, so a swallowed failure ends the
+    # run green over a cluster where ArgoCD and everything after it sits Pending, looking
+    # like a scheduling problem rather than a bootstrap step that never happened.
+    # `failed_when: false` swallowed all of them: API server not up yet, kubeconfig never
+    # copied, RBAC denial, node not yet registered. Tolerate only `taint ... not found`,
+    # which is what a re-run hits once the taint is already gone.
+    #
+    # Matched per line rather than across the whole of stderr: kubectl prints one message
+    # per failure, so under `--all` a worker that never carried the taint reports `not
+    # found` on every run, and a whole-of-stderr test would find that line and pass over a
+    # real error standing beside it. Empty stderr stays a failure too -- the command module
+    # reports a binary it could not execute as rc 2 with stdout and stderr both empty.
     - name: Remove control-plane taint for single-node cluster
       command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
-      failed_when: false
+      register: untaint
+      changed_when: "'untainted' in untaint.stdout"
+      failed_when: >-
+        untaint.rc != 0 and
+        (untaint.stderr_lines | select | list | length == 0 or
+        untaint.stderr_lines | select
+        | reject('search', 'taint "node-role.kubernetes.io/control-plane" not found')
+        | list | length > 0)
+
+    # The task above decides from what kubectl said; this decides from what the cluster
+    # looks like afterwards, so a stderr shape the match does not anticipate cannot end
+    # the run green. It also catches the case the parse cannot see at all: a removal that
+    # reported success without sticking.
+    #
+    # Every taint key on every node, matched in the assert rather than by a jsonpath
+    # `?(@.key=="...")` filter: `command` splits with shlex, which eats the quotes that
+    # filter needs, leaving kubectl to read the bare key as an identifier and exit 1 --
+    # taking the play down here, before the assert could report anything.
+    - name: Check for a remaining control-plane taint
+      command: kubectl get nodes -o jsonpath={.items[*].spec.taints[*].key}
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      register: remaining_taints
+      changed_when: false
+
+    - name: Assert the control-plane taint is gone
+      assert:
+        that: "'node-role.kubernetes.io/control-plane' not in remaining_taints.stdout"
+        fail_msg: >-
+          A node still carries node-role.kubernetes.io/control-plane, so nothing will
+          schedule on this cluster.
+        success_msg: no node carries the control-plane taint
 
     # ── Cilium CNI ────────────────────────────────────────
     # A missing key leaves this undefined rather than raising, so the assert below can
