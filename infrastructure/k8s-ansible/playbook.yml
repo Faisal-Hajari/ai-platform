@@ -130,11 +130,13 @@
     # (a container finishing hours before it started) and kubelet can decide a healthy
     # container died. It then retries CreateContainer forever against a name reservation
     # held by a half-created container -- a wedge that survives restarting either daemon,
-    # because the reservation lives in containerd's bolt metadata store, not in memory.
+    # because containerd re-reserves the name from the orphan's record in bolt on startup.
     # See infrastructure/scripts/recover_apiserver.sh to clear a node already stuck.
     #
     # chrony-wait blocks until the clock is within 0.1s, which is what makes
-    # time-sync.target mean anything; the drop-ins hold both daemons behind it.
+    # time-sync.target mean anything; the drop-ins hold both daemons behind it. Cost: on
+    # a boot where NTP is unreachable both daemons start up to 180s late, bounded by
+    # chrony-wait's own TimeoutStartSec -- the boot does not hang.
     - name: Install chrony
       apt:
         name: chrony
@@ -166,7 +168,6 @@
         mode: '0644'
         content: |
           [Unit]
-          Wants=time-sync.target
           After=time-sync.target
       loop:
         - kubelet
