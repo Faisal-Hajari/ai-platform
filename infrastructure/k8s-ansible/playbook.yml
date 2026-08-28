@@ -327,17 +327,20 @@
         untaint.rc != 0 and
         (untaint.stderr_lines | select | list | length == 0 or
         untaint.stderr_lines | select
-        | reject('search', 'taint "node-role\\.kubernetes\\.io/control-plane" not found')
+        | reject('search', 'taint "node-role.kubernetes.io/control-plane" not found')
         | list | length > 0)
 
     # The task above decides from what kubectl said; this decides from what the cluster
     # looks like afterwards, so a stderr shape the match does not anticipate cannot end
     # the run green. It also catches the case the parse cannot see at all: a removal that
     # reported success without sticking.
+    #
+    # Every taint key on every node, matched in the assert rather than by a jsonpath
+    # `?(@.key=="...")` filter: `command` splits with shlex, which eats the quotes that
+    # filter needs, leaving kubectl to read the bare key as an identifier and exit 1 --
+    # taking the play down here, before the assert could report anything.
     - name: Check for a remaining control-plane taint
-      command: >-
-        kubectl get nodes -o
-        jsonpath={.items[*].spec.taints[?(@.key=="node-role.kubernetes.io/control-plane")].key}
+      command: kubectl get nodes -o jsonpath={.items[*].spec.taints[*].key}
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
@@ -346,7 +349,7 @@
 
     - name: Assert the control-plane taint is gone
       assert:
-        that: remaining_taints.stdout | trim == ''
+        that: "'node-role.kubernetes.io/control-plane' not in remaining_taints.stdout"
         fail_msg: >-
           A node still carries node-role.kubernetes.io/control-plane, so nothing will
           schedule on this cluster.
