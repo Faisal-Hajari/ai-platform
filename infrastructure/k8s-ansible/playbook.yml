@@ -311,46 +311,54 @@
       changed_when: false
       failed_when: false
 
-    # Unpacked as root, so not through a predictable path in a world-writable /tmp.
-    - name: Create a scratch directory for the Cilium CLI download
-      tempfile:
-        state: directory
-        suffix: cilium-cli
-      register: cilium_cli_tmp
+    # The gate resolves `cilium` through PATH while the tasks below write to
+    # /usr/local/bin, so a CLI already installed elsewhere skips the block entirely
+    # rather than leaving the chmod to fail on a path that was never going to exist.
+    - name: Install the pinned Cilium CLI
       when: cilium_cli_version not in cilium_cli_installed.stdout
+      block:
+        # Unpacked as root, so not through a predictable path in a world-writable /tmp.
+        - name: Create a scratch directory for the Cilium CLI download
+          tempfile:
+            state: directory
+            suffix: cilium-cli
+          register: cilium_cli_tmp
 
-    # get_url checks the checksum before the file lands, so a mismatch fails the task
-    # rather than leaving an unverified archive for the next task to unpack.
-    - name: Download the pinned Cilium CLI
-      get_url:
-        url: >-
-          https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ release_arch }}.tar.gz
-        dest: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
-        checksum: sha256:{{ cilium_cli_sha256[release_arch] }}
-        mode: '0644'
-      when: cilium_cli_version not in cilium_cli_installed.stdout
+        # get_url checks the checksum before the file lands, so a mismatch fails the task
+        # rather than leaving an unverified archive for the next task to unpack.
+        - name: Download the pinned Cilium CLI
+          get_url:
+            url: >-
+              https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ release_arch }}.tar.gz
+            dest: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
+            checksum: sha256:{{ cilium_cli_sha256[release_arch] }}
+            mode: '0644'
 
-    # No mode here: unarchive would apply it to /usr/local/bin itself, which Ubuntu ships
-    # as 2775 root:staff. The binary's own mode is set below.
-    - name: Install the Cilium CLI
-      unarchive:
-        src: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
-        dest: /usr/local/bin
-        remote_src: true
-      when: cilium_cli_version not in cilium_cli_installed.stdout
+        # A single-file archive, so it extracts straight into place. No mode here:
+        # unarchive applies file args to dest, and Ubuntu ships /usr/local/bin as
+        # 2775 root:staff. The binary's own mode is set below.
+        - name: Install the Cilium CLI
+          unarchive:
+            src: "{{ cilium_cli_tmp.path }}/cilium.tar.gz"
+            dest: /usr/local/bin
+            remote_src: true
 
-    - name: Remove the Cilium CLI scratch directory
-      file:
-        path: "{{ cilium_cli_tmp.path }}"
-        state: absent
-      when: cilium_cli_tmp.path is defined
+        - name: Ensure the Cilium CLI is executable
+          file:
+            path: /usr/local/bin/cilium
+            owner: root
+            group: root
+            mode: '0755'
 
-    - name: Ensure the Cilium CLI is executable
-      file:
-        path: /usr/local/bin/cilium
-        owner: root
-        group: root
-        mode: '0755'
+      # A checksum mismatch -- the intended outcome of a botched pin bump -- aborts the
+      # play, so a cleanup task sitting after the block would never run and every
+      # affected node would keep a root-owned scratch directory.
+      always:
+        - name: Remove the Cilium CLI scratch directory
+          file:
+            path: "{{ cilium_cli_tmp.path }}"
+            state: absent
+          when: cilium_cli_tmp.path is defined
 
     # Read straight out of the ArgoCD-managed values so the bootstrap install and the
     # eventual ArgoCD sync cannot disagree. Same failure mode recover_cilium.sh exists
@@ -428,45 +436,45 @@
       changed_when: false
       failed_when: false
 
-    - name: Create a scratch directory for the Helm download
-      tempfile:
-        state: directory
-        suffix: helm
-      register: helm_tmp
+    - name: Install the pinned Helm release
       when: helm_version not in helm_installed.stdout
+      block:
+        - name: Create a scratch directory for the Helm download
+          tempfile:
+            state: directory
+            suffix: helm
+          register: helm_tmp
 
-    - name: Download the pinned Helm release
-      get_url:
-        url: https://get.helm.sh/helm-{{ helm_version }}-linux-{{ release_arch }}.tar.gz
-        dest: "{{ helm_tmp.path }}/helm.tar.gz"
-        checksum: sha256:{{ helm_sha256[release_arch] }}
-        mode: '0644'
-      when: helm_version not in helm_installed.stdout
+        - name: Download the pinned Helm release
+          get_url:
+            url: https://get.helm.sh/helm-{{ helm_version }}-linux-{{ release_arch }}.tar.gz
+            dest: "{{ helm_tmp.path }}/helm.tar.gz"
+            checksum: sha256:{{ helm_sha256[release_arch] }}
+            mode: '0644'
 
-    # Unpacked to the scratch directory rather than straight into /usr/local/bin because
-    # the tarball carries its LICENSE and README alongside the binary.
-    - name: Unpack Helm
-      unarchive:
-        src: "{{ helm_tmp.path }}/helm.tar.gz"
-        dest: "{{ helm_tmp.path }}"
-        remote_src: true
-      when: helm_version not in helm_installed.stdout
+        # Unpacked to the scratch directory rather than straight into /usr/local/bin
+        # because this tarball carries its LICENSE and README alongside the binary.
+        - name: Unpack Helm
+          unarchive:
+            src: "{{ helm_tmp.path }}/helm.tar.gz"
+            dest: "{{ helm_tmp.path }}"
+            remote_src: true
 
-    - name: Install the Helm binary
-      copy:
-        src: "{{ helm_tmp.path }}/linux-{{ release_arch }}/helm"
-        dest: /usr/local/bin/helm
-        remote_src: true
-        owner: root
-        group: root
-        mode: '0755'
-      when: helm_version not in helm_installed.stdout
+        - name: Install the Helm binary
+          copy:
+            src: "{{ helm_tmp.path }}/linux-{{ release_arch }}/helm"
+            dest: /usr/local/bin/helm
+            remote_src: true
+            owner: root
+            group: root
+            mode: '0755'
 
-    - name: Remove the Helm scratch directory
-      file:
-        path: "{{ helm_tmp.path }}"
-        state: absent
-      when: helm_tmp.path is defined
+      always:
+        - name: Remove the Helm scratch directory
+          file:
+            path: "{{ helm_tmp.path }}"
+            state: absent
+          when: helm_tmp.path is defined
 
   handlers:
     - name: restart containerd
