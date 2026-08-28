@@ -311,8 +311,20 @@
     # registered. On a single-node cluster this taint is what makes the node schedulable
     # at all, so a swallowed failure ends the run green over a cluster where ArgoCD and
     # every workload after it sit Pending -- and it reads as a scheduling problem rather
-    # than as a bootstrap step that never happened. Match the one expected message
+    # than as a bootstrap step that never happened. Tolerate the one expected message
     # instead, so every other way this can fail still fails the run.
+    #
+    # Rejected line by line rather than as a substring of the whole of stderr, because
+    # `--all` can emit both in one call: a worker that joins later never carried the
+    # taint, so it reports `not found` on every run, and a substring test would then
+    # find that line and pass over a genuine error printed beside it -- restoring
+    # `failed_when: false` for anything that fails alongside it. Requiring every stderr
+    # line to be the expected one holds however many nodes lack the taint.
+    #
+    # An empty stderr is a failure, not a pass: the command module reports a binary it
+    # could not execute at all as rc 2 with stdout and stderr both empty, and "no line
+    # left after rejecting the expected one" would otherwise read that as the tolerated
+    # case. A kubectl missing from PATH has to fail the run like any other broken setup.
     - name: Remove control-plane taint for single-node cluster
       command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
       environment:
@@ -322,7 +334,10 @@
       changed_when: "'untainted' in untaint.stdout"
       failed_when: >-
         untaint.rc != 0 and
-        'taint "node-role.kubernetes.io/control-plane" not found' not in untaint.stderr
+        (untaint.stderr_lines | select | list | length == 0 or
+        untaint.stderr_lines | select
+        | reject('search', 'taint "node-role.kubernetes.io/control-plane" not found')
+        | list | length > 0)
 
     # ── Cilium CNI ────────────────────────────────────────
     # A missing key leaves this undefined rather than raising, so the assert below can
