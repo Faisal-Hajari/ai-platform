@@ -634,19 +634,37 @@
     # ── Cilium CNI ────────────────────────────────────────
     # The chart is an umbrella over the upstream cilium chart, and charts/ and Chart.lock
     # are gitignored -- they are a resolved cache, not source -- so the dependency has to
-    # be fetched on the node before anything can render. `update` rather than `build`
-    # because a fresh checkout has no lock file for `build` to read.
+    # be fetched on the node before anything can render.
     #
+    # Gated on the cache, because re-running this play is now the only update path there
+    # is and an unconditional resolve makes every re-run need helm.cilium.io reachable --
+    # including one that changes nothing. `helm dependency build` is not the fix: it
+    # re-downloads the tarball even with a matching Chart.lock and a populated charts/,
+    # and --skip-refresh does not change that, so it needs the network just the same.
+    #
+    # Keyed on the versions Chart.yaml declares, not on charts/ merely being non-empty.
+    # That is the difference between a cache check and the `creates:` guard this section
+    # exists to be rid of: bump the dependency version and the tarball named below does
+    # not exist, so the resolve runs. A version range would never match a literal
+    # filename and would simply always resolve, which is the safe direction to fail.
+    - name: Read the Cilium chart's declared dependencies
+      set_fact:
+        cilium_chart: "{{ lookup('file', cilium_chart_dir + '/Chart.yaml') | from_yaml }}"
+
+    - name: Check whether those dependencies are already in the chart's cache
+      stat:
+        path: "{{ cilium_chart_dir }}/charts/{{ item.name }}-{{ item.version }}.tgz"
+      loop: "{{ cilium_chart.dependencies | default([]) }}"
+      become: false
+      register: cilium_deps_cached
+
     # become: false, like every task below it: repo_path is inside the operator's home,
     # and a root-owned charts/ there would break the operator's own `helm dependency
     # update` and infrastructure/scripts/check_deployments.sh afterwards.
     - name: Resolve the Cilium chart's dependencies
       command: helm dependency update {{ cilium_chart_dir }}
       become: false
-      # Fills a gitignored cache in the checkout; it changes nothing about the node or
-      # the cluster, and reporting it would mark every run changed before helm has even
-      # been asked to do anything.
-      changed_when: false
+      when: cilium_deps_cached.results | rejectattr('stat.exists') | list | length > 0
 
     # This used to be `cilium install`/`cilium upgrade` behind
     # `creates: /etc/cni/net.d/05-cilium.conflist`, which made the bootstrap one-shot: the
@@ -659,9 +677,25 @@
     # No -f: values.yaml sits inside the chart, so it is already the chart's defaults --
     # the same file, read the same way, as `helm template` in check_deployments.sh.
     #
-    # --wait because the tasks after this one need a working datapath: without it ArgoCD's
-    # pods are scheduled against a CNI that may not be ready and its 120s rollout waits
-    # race the agent coming up. Deliberately not --atomic: rolling a half-applied CNI back
+    # Deliberately NOT --wait. Helm counts a LoadBalancer Service as not-ready until
+    # .status.loadBalancer.ingress is populated, and this chart renders
+    # kube-system/cilium-ingress as exactly that, with no spec.externalIPs to short-circuit
+    # the check. That address can only come from LB-IPAM, which needs the
+    # CiliumLoadBalancerIPPool applied three tasks below -- which in turn needs a CRD that
+    # does not exist until the operator this release starts registers it. --wait here is
+    # therefore circular: it blocks for the whole timeout on an address the play has not
+    # yet made possible, and only then fails.
+    #
+    # And it fails expensively on the run that matters. A first bootstrap leaves the
+    # release with a single failed *install* revision, so the next `helm upgrade --install`
+    # exits with "has no deployed releases" and the node stays wedged until someone runs
+    # `helm uninstall cilium` by hand -- on precisely the nuke-and-rebuild path
+    # system-apps/README.md nominates for the migration. Nothing warned about this before
+    # because nothing waited: `cilium install` never watched that Service, and under ArgoCD
+    # an address-less LoadBalancer just left the Application Progressing.
+    #
+    # What --wait was actually being paid for is the datapath, and that is waited on
+    # explicitly below. Deliberately not --atomic either: rolling a half-applied CNI back
     # to the previous release is not a safer place to leave the node than forward.
     #
     # This reports changed on every run and that is honest, not noise: helm has no dry-run
@@ -672,17 +706,33 @@
       command: >-
         helm upgrade --install cilium {{ cilium_chart_dir }}
         --namespace kube-system
-        --wait --timeout 10m
+        --timeout 10m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
 
+    # The half of --wait worth having, named rather than inferred: the tasks after this
+    # need a working datapath, or ArgoCD's pods are scheduled against a CNI that is not up
+    # and its 120s rollout waits race the agent coming up. Asking about the agent and the
+    # operator specifically also keeps the ingress Service -- which cannot have an address
+    # this early -- out of the question being asked.
+    - name: Wait for the Cilium datapath
+      shell: |
+        set -eu
+        kubectl -n kube-system rollout status ds/cilium --timeout=10m
+        kubectl -n kube-system rollout status deploy/cilium-operator --timeout=5m
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      changed_when: false
+
     # The pool and the L2 policy are CiliumLoadBalancerIPPool and
     # CiliumL2AnnouncementPolicy, and those CRDs are registered by cilium-operator at
-    # runtime -- the chart does not ship them under crds/, so --wait above says nothing
-    # about whether they exist yet. Polling for the object first, then waiting on
-    # Established: `kubectl wait` errors immediately on a resource that is not there at
-    # all, so waiting alone would fail on exactly the cold run this exists for.
+    # runtime -- the chart does not ship them under crds/, so the rollout above says the
+    # operator is running, not that it has finished registering. Polling for the object
+    # first, then waiting on Established: `kubectl wait` errors immediately on a resource
+    # that is not there at all, so waiting alone would fail on exactly the cold run this
+    # exists for.
     - name: Wait for the Cilium CRDs the configuration below needs
       shell: |
         set -eu
@@ -714,6 +764,39 @@
       become: false
       register: cilium_config
       changed_when: cilium_config.stdout_lines | reject('search', ' unchanged$') | list | length > 0
+
+    # check_deployments.sh asserts statically that the ingress pin sits inside the pool;
+    # this is the cluster confirming it. When they disagree LB-IPAM sets
+    # IPAMRequestSatisfied=False on cilium-ingress, the Service never gets an address and
+    # every Ingress in the cluster is dead -- and it does not self-heal, because LB-IPAM
+    # will not evict a holder to make room. That is the one failure mode this play can
+    # observe directly and used not to, so the run went green over a cluster whose ingress
+    # had never come up, with nothing reconciling behind it to notice later.
+    #
+    # A poll and an explicit message rather than `kubectl wait --for=jsonpath=...`: the
+    # thing worth having here is the reason, and a bare wait times out saying only that it
+    # did. If the Service is missing entirely the get fails under `set -e` -- that means
+    # ingressController.enabled was turned off, which check_deployments.sh fails on first.
+    - name: Wait for the ingress address to be served
+      shell: |
+        set -eu
+        for _ in $(seq 30); do
+          ip=$(kubectl -n kube-system get service cilium-ingress \
+                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          if [ -n "$ip" ]; then
+            echo "cilium-ingress is serving $ip"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "cilium-ingress still has no LoadBalancer address after 60s -- LB-IPAM has" >&2
+        echo "no pool that can serve the lbipam.cilium.io/ips pin in values.yaml." >&2
+        kubectl -n kube-system describe service cilium-ingress >&2
+        exit 1
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      changed_when: false
 
     # ── ArgoCD ────────────────────────────────────────────
     - name: Create argocd namespace

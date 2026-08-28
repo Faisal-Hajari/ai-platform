@@ -60,6 +60,26 @@ sit inside the pool declared in `config/ip-pool.yaml`; as two separately-synced
 Applications with no ordering between them, that pair could disagree transiently even
 when both files were individually correct.
 
+The order the play uses is load-bearing and worth knowing before editing it:
+
+1. `helm upgrade --install`, **without `--wait`**. Helm counts a LoadBalancer Service as
+   not-ready until `.status.loadBalancer.ingress` is populated, and this chart renders
+   `kube-system/cilium-ingress` as one with no `spec.externalIPs`. That address comes from
+   LB-IPAM, which needs the pool in step 4 — so `--wait` here waits for something only a
+   later step can cause, times out, and leaves the release with a failed *install*
+   revision that makes every subsequent `helm upgrade --install` exit with `has no
+   deployed releases`.
+2. `rollout status` on `ds/cilium` and `deploy/cilium-operator` — the wait that `--wait`
+   was actually being used for, asked about the datapath rather than about every object
+   in the release.
+3. Poll for the two CRDs, then wait for `Established`. `cilium-operator` registers them at
+   runtime; the chart does not ship them under `crds/`.
+4. `kubectl apply -f config/`.
+5. Wait for `cilium-ingress` to be served an address. A pin outside the pool leaves
+   LB-IPAM with `IPAMRequestSatisfied=False`, no address on the Service, and every Ingress
+   in the cluster dead — with no reconciler behind the play, a run that went green here
+   would be the last thing to notice.
+
 **ArgoCD's directory holds `applicationset.yaml` alone.** ArgoCD installs from a pinned
 upstream URL (`v3.3.11`, in `../playbook.yml`) and that 20k-line manifest is not worth
 vendoring. This leaves the two entries uneven — one is a chart plus values, the other a
@@ -87,6 +107,13 @@ carried one (`creates: /etc/cni/net.d/05-cilium.conflist`) which made the bootst
 one-shot: Ansible skipped the whole task once the conflist existed, so the `cilium
 upgrade` branch inside it was unreachable and ArgoCD was the only thing that could change
 Cilium on a live cluster.
+
+The dependency resolve before it *is* gated, and that is not the same thing: it is a
+cache fill, keyed on the exact `name-version.tgz` that `Chart.yaml` declares, so bumping
+the pinned version resolves again while a re-run that changes nothing does not need
+`helm.cilium.io` to be reachable. (`helm dependency build` would not do: it re-downloads
+even against a matching `Chart.lock` and a populated `charts/`, `--skip-refresh`
+included.)
 
 ## Changing something here
 

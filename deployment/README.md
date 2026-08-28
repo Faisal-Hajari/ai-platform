@@ -25,3 +25,9 @@ Adding a chart:
   before pushing. It renders every chart the way ArgoCD will.
 - `charts/` and `Chart.lock` are gitignored — they are `helm dependency update` output,
   resolved by ArgoCD's repo-server at sync time.
+
+`check_deployments.sh` used to fail when this directory matched no charts. That check went
+away with the move — it would now fire on every run — which means a chart *disappearing*
+from here is no longer reported by anything. The Cilium half is still covered, by the
+cross-file pool check that names the chart it needs; nothing equivalent guards a future
+entry, so notice it when the first one lands.
