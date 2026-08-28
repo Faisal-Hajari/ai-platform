@@ -18,5 +18,10 @@ spec:
     #
     # .200 is the address ../cilium/values.yaml pins for kube-system/cilium-ingress
     # via lbipam.cilium.io/ips -- keep the two in step.
+    # infrastructure/scripts/check_deployments.sh asserts that containment, including
+    # the CIDR normalization above, and .github/workflows/check-deployments.yml runs it
+    # on every change under deployment/. That run going red is the warning that arrives
+    # before the cluster's, which is IPAMRequestSatisfied=False and every Ingress dead --
+    # a signal, not a merge gate, so do not sail past it.
     - start: "192.168.100.200"
       stop: "192.168.100.215"
