@@ -4,17 +4,19 @@ metadata:
   name: local-pool
 spec:
   blocks:
-    # Written as start/stop, not a CIDR. "192.168.100.200/28" was not on a /28
-    # boundary, so LB-IPAM normalized it to 192.168.100.192/28 -- the range did not
-    # mean what it read, and .200 sat inside it only by that accident.
+    # Written as start/stop, not a CIDR, because .200-.215 is not a CIDR: it spans
+    # the 192.168.100.192/28 boundary. An earlier revision did write it as
+    # "192.168.100.200/28", which LB-IPAM normalized to 192.168.100.192/28 -- so the
+    # pool quietly handed out .192-.199 as well, and .200 sat inside it only by that
+    # accident (#8).
     #
-    # These bounds are that same real range, stated outright. Deliberately NOT
-    # .200-.215, which is what the old CIDR looked like it meant: default/test-nginx
-    # holds .192, and moving the floor to .200 would push it out of the pool, so
-    # LB-IPAM would release and reallocate it lowest-free -- landing it on the .200
-    # that ../cilium/values.yaml pins for the ingress. The two live in different
-    # ArgoCD Applications (cilium-config and cilium) with no ordering guarantee, so
-    # that race would strand cilium-ingress with IPAMRequestSatisfied: False and no
-    # self-healing, since LB-IPAM will not evict an existing holder.
-    - start: "192.168.100.192"
-      stop: "192.168.100.207"
+    # The floor stayed at .192 for a while longer because default/test-nginx held
+    # .192 and moving the floor would have evicted it onto the .200 that
+    # ../cilium/values.yaml pins for the ingress. That service was an untracked
+    # hand-made test fixture (#16) and has since been deleted, so the floor is free
+    # to be what it was always meant to be.
+    #
+    # .200 is the address ../cilium/values.yaml pins for kube-system/cilium-ingress
+    # via lbipam.cilium.io/ips -- keep the two in step.
+    - start: "192.168.100.200"
+      stop: "192.168.100.215"
