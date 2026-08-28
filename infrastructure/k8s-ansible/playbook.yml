@@ -71,10 +71,33 @@
           vault_argocd_deploy_key is missing or unusable in
           group_vars/k8s-master/vault.yml. ArgoCD needs the private half of a GitHub deploy
           key with read access to this repo; generate one with
-          `ssh-keygen -t ed25519 -C argocd -f argocd_deploy_key`, add the public half under
-          the repo's Deploy keys on GitHub, then put the private half in the vault with
+          `ssh-keygen -t ed25519 -N '' -C argocd -f argocd_deploy_key`, add the public half
+          under the repo's Deploy keys on GitHub, then put the private half in the vault
+          with
           `ansible-vault edit group_vars/k8s-master/vault.yml`.
         success_msg: the ArgoCD deploy key is present
+
+    # The delimiters cannot see a passphrase -- an encrypted key is byte-for-byte
+    # conventional at both ends -- and ArgoCD has nowhere to enter one, so that is one more
+    # well-formed Secret holding an unusable key. It is also the failure the command above
+    # used to walk you into, since ssh-keygen prompts for a passphrase unless given -N.
+    # OpenSSH stores the cipher name in the clear at the head of the base64 body, so an
+    # unencrypted key always starts "openssh-key-v1\0" then "none"; an encrypted one names
+    # its cipher there instead. Checked identical across ed25519, RSA and ECDSA.
+    #
+    # This does require the OpenSSH container, which is what ssh-keygen writes unless told
+    # otherwise -- a `-m PEM` key is rejected here. That is a constraint worth making rather
+    # than hiding, so the message says so and how to convert.
+    - name: Assert the ArgoCD deploy key has no passphrase
+      assert:
+        that: "'b3BlbnNzaC1rZXktdjEAAAAABG5vbmU' in argocd_deploy_key"
+        fail_msg: >-
+          vault_argocd_deploy_key is passphrase-protected, or is not an OpenSSH-format key.
+          ArgoCD has nowhere to enter a passphrase, so it cannot use an encrypted key --
+          regenerate it with `-N ''`. If it is a PEM key, `ssh-keygen -p -N '' -f <key>`
+          rewrites it in OpenSSH format; this assert reads the cipher name out of that
+          format and cannot see inside any other.
+        success_msg: the ArgoCD deploy key is unencrypted
 
   tasks:
     # ── Swap ──────────────────────────────────────────────
