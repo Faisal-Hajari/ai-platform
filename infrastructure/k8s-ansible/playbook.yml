@@ -655,6 +655,8 @@
       stat:
         path: "{{ cilium_chart_dir }}/charts/{{ item.name }}-{{ item.version }}.tgz"
       loop: "{{ cilium_chart.dependencies | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}-{{ item.version }}"
       become: false
       register: cilium_deps_cached
 
@@ -696,7 +698,10 @@
     #
     # What --wait was actually being paid for is the datapath, and that is waited on
     # explicitly below. Deliberately not --atomic either: rolling a half-applied CNI back
-    # to the previous release is not a safer place to leave the node than forward.
+    # to the previous release is not a safer place to leave the node than forward. And no
+    # --timeout: with --wait gone it bounds only hook execution, and this chart renders no
+    # helm.sh/hook resources -- carrying it would read as though something here still
+    # waits on the cluster, which is the misreading this comment exists to prevent.
     #
     # This reports changed on every run and that is honest, not noise: helm has no dry-run
     # that answers "would this change anything" cheaply, and gating the upgrade on the
@@ -706,21 +711,30 @@
       command: >-
         helm upgrade --install cilium {{ cilium_chart_dir }}
         --namespace kube-system
-        --timeout 10m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
 
     # The half of --wait worth having, named rather than inferred: the tasks after this
     # need a working datapath, or ArgoCD's pods are scheduled against a CNI that is not up
-    # and its 120s rollout waits race the agent coming up. Asking about the agent and the
-    # operator specifically also keeps the ingress Service -- which cannot have an address
-    # this early -- out of the question being asked.
+    # and its 120s rollout waits race the agent coming up. Naming the workloads also keeps
+    # the ingress Service -- which cannot have an address this early -- out of the question
+    # being asked.
+    #
+    # All three the release actually runs, not just the agent: cilium-envoy is the
+    # standalone DaemonSet that serves the L7 Ingress path, which is the whole point of
+    # ingressController in values.yaml. The step below proves LB-IPAM handed the shared
+    # entrypoint an address; it says nothing about whether anything is listening behind it.
+    #
+    # `kubectl rollout status` hard-errors on an OnDelete update strategy rather than
+    # returning. All three render RollingUpdate today; setting updateStrategy in
+    # values.yaml would break this task, not merely slow it.
     - name: Wait for the Cilium datapath
       shell: |
         set -eu
         kubectl -n kube-system rollout status ds/cilium --timeout=10m
         kubectl -n kube-system rollout status deploy/cilium-operator --timeout=5m
+        kubectl -n kube-system rollout status ds/cilium-envoy --timeout=5m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false

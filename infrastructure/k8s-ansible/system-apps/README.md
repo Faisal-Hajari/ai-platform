@@ -69,9 +69,13 @@ The order the play uses is load-bearing and worth knowing before editing it:
    later step can cause, times out, and leaves the release with a failed *install*
    revision that makes every subsequent `helm upgrade --install` exit with `has no
    deployed releases`.
-2. `rollout status` on `ds/cilium` and `deploy/cilium-operator` — the wait that `--wait`
-   was actually being used for, asked about the datapath rather than about every object
-   in the release.
+2. `rollout status` on `ds/cilium`, `deploy/cilium-operator` and `ds/cilium-envoy` — the
+   wait that `--wait` was actually being used for, asked about the datapath rather than
+   about every object in the release. Envoy is in the list because it serves the L7
+   Ingress path; step 5 proves the shared entrypoint has an address, not that anything is
+   listening behind it. All three render `RollingUpdate`, which `kubectl rollout status`
+   requires — it hard-errors on `OnDelete`, so setting `updateStrategy` in `values.yaml`
+   would break this step rather than slow it.
 3. Poll for the two CRDs, then wait for `Established`. `cilium-operator` registers them at
    runtime; the chart does not ship them under `crds/`.
 4. `kubectl apply -f config/`.
