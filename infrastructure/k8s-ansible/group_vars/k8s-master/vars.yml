@@ -1,2 +1,8 @@
 ansible_become_pass: "{{ vault_become_pass }}"
 repo_path: "/home/{{ ansible_user }}/dev/ai-platform"
+
+# Private half of a GitHub deploy key with read access to this repo, which ArgoCD needs to
+# clone the SSH remote in argocd/applicationset.yaml. Defaulted to empty rather than left
+# to raise, so a vault without it fails on the playbook's own assert -- which says what is
+# missing and how to add it -- instead of an undefined-variable trace.
+argocd_deploy_key: "{{ vault_argocd_deploy_key | default('') }}"
