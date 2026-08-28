@@ -34,6 +34,20 @@ resources that are already there.
 
 ## Bootstrap
 
+On a fresh machine, one command:
+
+```bash
+./infrastructure/scripts/build_cluster.sh
+```
+
+It installs what the play cannot install for itself (Ansible, its two collections,
+`crictl`), checks the prerequisites the play only discovers hundreds of tasks in, runs
+the play against *this* checkout, and then verifies the finished cluster. The one thing
+it cannot create for you is `group_vars/k8s-master/vault.yml`; it says so, and says what
+goes in it.
+
+The two commands it wraps, if you would rather run them by hand:
+
 ```bash
 ./infrastructure/scripts/install_ansible.sh
 cd infrastructure/k8s-ansible
@@ -48,7 +62,11 @@ load group_vars without the secret. `--vault-password-file` works too.
 Cilium chart it installs with Helm, its LoadBalancer configuration, and the
 ApplicationSet. It already defaults to `/home/{{ ansible_user }}/dev/ai-platform` in
 `group_vars/k8s-master/vars.yml`; pass `-e repo_path=...` only if the checkout lives
-somewhere else.
+somewhere else. That default is a *guess* about where the checkout is, and a wrong guess
+is silent: from a second clone, a git worktree or `/opt`, the play reads `system-apps/`
+out of the guessed directory and deploys whatever is on disk there rather than what you
+are looking at. `build_cluster.sh` passes the checkout it was launched from, so running
+the play through it cannot make that mistake.
 
 Re-running the play is also the *only* update path for anything under `system-apps/`:
 nothing reconciles behind it, and `helm upgrade --install` corrects drift on every run.
@@ -99,12 +117,15 @@ Each script carries a shebang and is executable, so run it directly.
 | `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Fix `k8sServiceHost` in `values.yaml` and re-run the playbook afterwards — the patches are a stopgap, and the playbook is now the only thing that renders Cilium. |
 | `recover_apiserver.sh` | Clears a static pod wedged in `CreateContainerError` after a backward clock step. Needs root and `crictl`. |
 | `nuke_cluster.sh` | Tears the cluster down far enough for the playbook to rebuild it, including the Cilium node-local state `kubeadm reset` leaves behind. Needs root and `crictl`. |
+| `build_cluster.sh` | Builds the cluster from a fresh machine: prerequisites, preflight checks, the playbook against this checkout, then verification of the finished cluster. Run as the login user, not with `sudo`. |
+| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning — so the next build is a fresh-machine build. `--keep-packages` stops at the `nuke_cluster.sh` line instead. Run as the login user, not with `sudo`. |
 
 ### crictl
 
 `nuke_cluster.sh` and `recover_apiserver.sh` need `crictl`, and `kubeadm reset` drives the
 CRI through it — without it the reset reports success while leaving containers running.
-It is not packaged on Ubuntu; install it from cri-tools.
+It is not packaged on Ubuntu. `build_cluster.sh` installs it, from this same pin; the
+block below is the same thing by hand.
 
 Pinned to a version and to the SHA256 of the release artefact itself, on the same
 reasoning as the Helm pin in `playbook.yml`: the checksum is what makes
