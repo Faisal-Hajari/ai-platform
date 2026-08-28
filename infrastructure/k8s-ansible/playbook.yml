@@ -111,12 +111,18 @@
         replace: 'SystemdCgroup = true'
       notify: restart containerd
 
-    # A no-op against `containerd config default` output, which enables CRI and has no
-    # disabled_plugins line at all; it only bites against the Ubuntu package's stub, which
-    # ships `disabled_plugins = ["cri"]`. That is the same stub the guard above is written
-    # for, so the two are a pair: whenever this task has anything to do, generation has
-    # just been skipped and the config is the stub -- and it is the assert below, not
-    # either replace, that decides whether the node ended up correct.
+    # Neither config this play normally sees reaches here with anything to match.
+    # `containerd config default` output enables CRI and has no disabled_plugins line at
+    # all; the Ubuntu package's stub does ship `disabled_plugins = ["cri"]`, but it has no
+    # SystemdCgroup either, so the guard above is true against it and generation has
+    # already overwritten it by the time this task runs. Generation is skipped only when
+    # the config already has SystemdCgroup, which by definition means it is not the stub.
+    #
+    # What is left is the case worth keeping the task for: a config that is neither --
+    # hand-rolled, or carried across an upgrade -- holding SystemdCgroup and a live
+    # `disabled_plugins = ["cri"]` at once. containerd would come up with no CRI service
+    # for kubelet to talk to, and the assert below would not catch it, because it only
+    # reads the cgroup driver.
     - name: Enable CRI plugin in containerd config
       replace:
         path: /etc/containerd/config.toml
@@ -450,6 +456,21 @@
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
+      register: argocd_install
+      failed_when: false
+
+    # Deferred to an assert so the failure this play now allows arrives with the reason
+    # attached, instead of a raw server-side-apply conflict dump from kubectl.
+    - name: Assert the ArgoCD apply succeeded
+      assert:
+        that: argocd_install.rc == 0
+        fail_msg: >-
+          kubectl apply failed for ArgoCD. If it reported a conflict, a field manager
+          other than kubectl owns part of the pinned manifest -- something outside this
+          playbook is managing ArgoCD. Settle that deliberately (take the field back, or
+          stop managing it elsewhere); re-adding --force-conflicts would only revert it
+          silently on every run. kubectl said: {{ argocd_install.stderr | default('') | trim }}
+        success_msg: ArgoCD applied with no field-ownership conflicts
 
     - name: Wait for ArgoCD to be ready
       command: kubectl rollout status deployment/argocd-server -n argocd --timeout=120s

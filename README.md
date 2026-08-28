@@ -13,12 +13,19 @@ System for serving AI models over k8s
 ## Bootstrap
 
 ```bash
-bash infrastructure/scripts/install_ansible.sh
-ansible-playbook -i inventory.ini playbook.yml -e repo_path=$PWD/../..
+./infrastructure/scripts/install_ansible.sh
+cd infrastructure/k8s-ansible
+ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass
 ```
 
-Run the playbook from `infrastructure/k8s-ansible/`; `repo_path` is the repository root,
-which the play reads Cilium's values and the ApplicationSet from.
+`--ask-vault-pass` is not optional: `group_vars/k8s-master/vars.yml` takes
+`ansible_become_pass` from the vault-encrypted `vault.yml` beside it, so the run cannot
+load group_vars without the secret. `--vault-password-file` works too.
+
+`repo_path` is the repository root, which the play reads Cilium's values and the
+ApplicationSet from. It already defaults to `/home/{{ ansible_user }}/dev/ai-platform` in
+`group_vars/k8s-master/vars.yml`; pass `-e repo_path=...` only if the checkout lives
+somewhere else.
 
 ## Scripts
 
@@ -37,10 +44,23 @@ Each script carries a shebang and is executable, so run it directly.
 
 `nuke_cluster.sh` and `recover_apiserver.sh` need `crictl`, and `kubeadm reset` drives the
 CRI through it — without it the reset reports success while leaving containers running.
-It is not packaged on Ubuntu; install it from cri-tools:
+It is not packaged on Ubuntu; install it from cri-tools.
+
+Pinned to a version and to the SHA256 of the release artefact itself, on the same
+reasoning as the Cilium CLI and Helm pins in `playbook.yml`: the checksum is what makes
+the version mean anything, and it is per version and per architecture, so bumping
+`VERSION` means replacing both digests. Only amd64 and arm64 are pinned — on anything
+else `ARCH` stays unset, the download 404s, and the chain stops before `sudo tar`.
 
 ```bash
 VERSION=v1.31.1
-curl -fsSL -o crictl.tar.gz "https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz"
-sudo tar zxvf crictl.tar.gz -C /usr/local/bin && rm -f crictl.tar.gz
+case "$(uname -m)" in
+  x86_64)  ARCH=amd64  SHA256=0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231 ;;
+  aarch64) ARCH=arm64  SHA256=cd70f9b2f75c9619f40450d4b6e2c74aaab619917da517eff6787b442f8b0e56 ;;
+esac
+
+curl -fsSL -o crictl.tar.gz "https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-$ARCH.tar.gz" &&
+  echo "$SHA256  crictl.tar.gz" | sha256sum -c - &&
+  sudo tar zxf crictl.tar.gz -C /usr/local/bin crictl
+rm -f crictl.tar.gz
 ```
