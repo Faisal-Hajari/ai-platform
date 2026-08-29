@@ -153,5 +153,6 @@ nothing inside the cluster can undo that.
 Note also that `helm upgrade --install cilium` adopts the release the Cilium CLI created
 (same name, same namespace) but changes the chart under it, and Helm refuses to take over
 resources that carry no `meta.helm.sh/release-name` ownership metadata. Sequencing the
-migration as `infrastructure/scripts/nuke_cluster.sh` plus a rebuild sidesteps both
-questions and exercises the new bootstrap path, which needs testing regardless.
+migration as `infrastructure/scripts/destroy_cluster.sh --keep-packages` plus a rebuild
+sidesteps both questions and exercises the new bootstrap path, which needs testing
+regardless.

@@ -46,8 +46,11 @@ cilium:
   # one back. That reader is gone (see ../README.md): a change here reaches the cluster
   # only through the checkout the playbook reads, and through nothing else.
   #
-  # So: infrastructure/scripts/nuke_cluster.sh, THEN re-run the playbook, which reads
-  # this file both for `kubeadm init --pod-network-cidr` and as the chart's values.
+  # So: infrastructure/scripts/destroy_cluster.sh --keep-packages, THEN re-run the
+  # playbook, which reads this file both for `kubeadm init --pod-network-cidr` and as the
+  # chart's values. (--keep-packages leaves kubeadm, containerd and the resolved chart
+  # cache in place, so the rebuild is the play alone; a full destroy works too and is
+  # simply slower.)
   ipam:
     operator:
       clusterPoolIPv4PodCIDRList: ["10.244.0.0/16"]

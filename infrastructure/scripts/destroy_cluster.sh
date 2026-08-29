@@ -4,19 +4,25 @@
 #
 # Usage: ./infrastructure/scripts/destroy_cluster.sh [--keep-packages] [--yes]
 #
-# This is the counterpart to build_cluster.sh, and a strictly bigger hammer than
-# nuke_cluster.sh. The difference is the intent:
+# This is the counterpart to build_cluster.sh, and it has two depths:
 #
-#   nuke_cluster.sh     resets the cluster so the *playbook can rebuild it*. Packages,
-#                       Helm, crictl, the apt repo, the sysctl and modules files and the
-#                       systemd drop-ins all stay, because the rebuild wants them.
-#   destroy_cluster.sh  removes the cluster *and everything installed to run it*, so the
-#                       next build is genuinely a fresh-machine build.
+#   --keep-packages  resets the cluster so the *playbook can rebuild it*. Packages, Helm,
+#                    crictl, the apt repo, the sysctl and modules files, the systemd
+#                    drop-ins and the resolved Helm chart cache all stay, because the
+#                    rebuild wants them.
+#   (default)        removes the cluster *and everything installed to run it*, so the next
+#                    build is genuinely a fresh-machine build.
+#
+# --keep-packages replaces nuke_cluster.sh, which did the same job and was deleted when
+# this grew a superset of it: same reset, same Cilium node-local state, same chart cache
+# left alone -- plus the state directories nuke never cleared, verified unmounts, and
+# containerd stopped before /etc/cni/net.d goes. It also resolves the invoking user's home
+# in preflight rather than from $SUDO_USER after the reset, which was #24.
 #
 # Run it as the login user, not with sudo -- it calls sudo where it needs to. Some of what
 # has to go lives in the operator's home (~/.kube, the Helm chart cache under the
 # checkout), and a script that already knows who it is does not have to guess the way
-# nuke_cluster.sh guesses at $SUDO_USER.
+# nuke_cluster.sh used to guess at $SUDO_USER.
 #
 # What it deliberately does NOT remove:
 #   Ansible and its  the one thing build_cluster.sh installs that this leaves behind.
@@ -54,7 +60,7 @@ Removes the Kubernetes cluster and everything installed to run it.
 Options:
   --keep-packages  Reset the cluster and clear node state, but leave the packages,
                    Helm, crictl, the apt repo and the host tuning in place. Roughly
-                   nuke_cluster.sh plus the state directories it does not touch.
+                   the old nuke_cluster.sh, plus the state directories it never cleared.
   -y, --yes        Do not ask for confirmation.
   -h, --help       This message.
 EOF
@@ -78,7 +84,7 @@ kubelet_mounts() { findmnt -rno TARGET | awk '/^\/var\/lib\/kubelet(\/|$)/' | so
 
 # ── Preflight ─────────────────────────────────────────────
 # Everything that could abort the run is decided here, before anything is destroyed.
-# #24 is the shape of the bug this avoids: nuke_cluster.sh resolves the invoking user's
+# #24 is the shape of the bug this avoids: nuke_cluster.sh resolved the invoking user's
 # home *after* `kubeadm reset`, under `set -e`, so a home it cannot resolve exits the
 # script halfway through a teardown -- past the reset, before the containerd restart.
 step "Preflight"
@@ -292,7 +298,7 @@ fi
 # `<name>-<version>.tgz` its Chart.yaml declares, so the cache already invalidates itself
 # when a dependency version changes. Wiping it otherwise only makes every rebuild need
 # helm.cilium.io reachable. nuke_cluster.sh left it in place for that reason; matching it
-# here is what makes --keep-packages a strict superset of that script.
+# here is what made --keep-packages a strict superset, and let that script be deleted.
 #
 # On a full destroy it goes: the next build is meant to be a fresh-machine build, and a
 # resolved cache pinned to whatever was current when it was written is not that.

@@ -120,13 +120,12 @@ Each script carries a shebang and is executable, so run it directly.
 | `check_deployments.sh` | Renders every chart in `system-apps/` and `deployment/` the way its deployer will and asserts the invariants that have bitten this cluster before. Run before pushing changes to either. |
 | `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Fix `k8sServiceHost` in `values.yaml` and re-run the playbook afterwards — the patches are a stopgap, and the playbook is now the only thing that renders Cilium. |
 | `recover_apiserver.sh` | Clears a static pod wedged in `CreateContainerError` after a backward clock step. Needs root and `crictl`. |
-| `nuke_cluster.sh` | Tears the cluster down far enough for the playbook to rebuild it, including the Cilium node-local state `kubeadm reset` leaves behind. Needs root and `crictl`. |
 | `build_cluster.sh` | Builds the cluster from a fresh machine: installs Ansible and its collections, repairs a half-configured apt source if an earlier run left one, runs the playbook, then prints the finished cluster's end state. Run as the login user, not with `sudo`. |
-| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning — then asserts the machine is actually clean. `--keep-packages` stops at the `nuke_cluster.sh` line instead. Leaves Ansible, chrony and Docker alone. Run as the login user, not with `sudo`. |
+| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning — then asserts the machine is actually clean. `--keep-packages` stops at the reset-and-clear-node-state line instead, leaving the packages and host tuning for the playbook to rebuild onto. Leaves Ansible, chrony and Docker alone. Run as the login user, not with `sudo`. |
 
 ### crictl
 
-`nuke_cluster.sh`, `recover_apiserver.sh` and `destroy_cluster.sh` all need `crictl`, and
+`recover_apiserver.sh` and `destroy_cluster.sh` both need `crictl`, and
 `kubeadm reset` drives the CRI through it — without it the reset reports success while
 leaving containers running. It is not packaged on Ubuntu.
 
