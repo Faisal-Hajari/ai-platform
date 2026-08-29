@@ -3,35 +3,32 @@
 #
 # Usage: ./infrastructure/scripts/build_cluster.sh [options]
 #
-# The playbook is the thing that builds the cluster; this script is everything that has
-# to be true before `ansible-playbook` can be run at all, plus the checks that turn the
-# ways it silently half-works into a message. README.md's Bootstrap section is the same
-# two commands by hand -- this exists because "by hand" was three undocumented
-# prerequisites (crictl, a vault, a checkout at the path group_vars guesses) and a
-# playbook that only tells you about the third of them once it is 500 lines in.
+# The playbook is what builds the cluster. This is the part that cannot be Ansible --
+# getting Ansible itself onto the box, and checking the things that must be true before
+# `ansible-playbook` can usefully start -- plus a short end-state summary afterwards.
 #
-# Deliberately NOT run as root. The playbook is `become: true` and takes its sudo
-# password from the vault, and roughly half its tasks are `become: false` because they
-# write into the operator's home -- ~/.kube/config, and the chart's charts/ cache under
-# repo_path. Running the whole thing as root leaves both root-owned, which breaks the
-# operator's own kubectl and every later `helm dependency update`.
+# Everything that CAN be a task is one. crictl used to be installed here, in a bash
+# reimplementation of the playbook's own pinned-download block; it is a play task now,
+# sharing that block's architecture resolution and checksum assert. The play also locates
+# its own charts (`playbook_dir`), so there is no repo_path to pass.
 #
-# Idempotent: every step checks before it acts, so re-running after a failure resumes
-# rather than redoing. `kubeadm init` is guarded by the playbook's own `creates:`.
+# Deliberately NOT run as root. The playbook is `become: true` and takes its sudo password
+# from the vault, and roughly half its tasks are `become: false` because they write into
+# the operator's home -- ~/.kube/config, and the chart's charts/ cache inside the checkout.
+# Running the whole thing as root leaves both root-owned, which breaks the operator's own
+# kubectl and every later `helm dependency update`.
+#
+# Idempotent: every step checks before it acts, so re-running after a failure resumes.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ANSIBLE_DIR="$REPO_ROOT/infrastructure/k8s-ansible"
 INVENTORY="$ANSIBLE_DIR/inventory.ini"
 VAULT_FILE="$ANSIBLE_DIR/group_vars/k8s-master/vault.yml"
-
-# Same pin as README.md's crictl block -- version and the SHA256 of the release artefact
-# itself, per version and per architecture, so bumping VERSION means replacing both
-# digests. Only amd64 and arm64 are pinned; anything else stops before the download
-# rather than installing something unverified.
-CRICTL_VERSION=v1.31.1
-CRICTL_SHA256_amd64=0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231
-CRICTL_SHA256_arm64=cd70f9b2f75c9619f40450d4b6e2c74aaab619917da517eff6787b442f8b0e56
+APPSET_FILE="$ANSIBLE_DIR/system-apps/argocd/applicationset.yaml"
+CILIUM_VALUES="$ANSIBLE_DIR/system-apps/cilium/values.yaml"
+K8S_KEYRING=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+K8S_APT_LIST=/etc/apt/sources.list.d/kubernetes.list
 
 VAULT_ARGS=()
 SKIP_RENDER_CHECK=0
@@ -48,12 +45,17 @@ Options:
   --skip-render-check         Do not run check_deployments.sh before the playbook.
   -h, --help                  This message.
 
-Anything after `--` is passed straight to ansible-playbook, so `-- --check` or
-`-- -vvv` work.
+Anything after `--` is passed straight to ansible-playbook, e.g. `-- -vvv`.
+(`--check` is not usable against this play: most of it is command/shell, and check mode
+skips the tasks the later ones read the results of.)
 
-Prerequisites this script installs if they are missing: Ansible, crictl.
-Prerequisite it cannot create for you: group_vars/k8s-master/vault.yml, which must hold
-vault_become_pass and vault_argocd_deploy_key. See the failure message if it is absent.
+Prerequisites this installs if missing: Ansible and its two collections. Everything else
+the node needs -- containerd, kubeadm, Helm, crictl -- is installed by the playbook.
+
+group_vars/k8s-master/vault.yml is tracked in this repo, so it is already present after a
+clone; what it cannot supply is its contents. It must hold vault_become_pass and
+vault_argocd_deploy_key, and a vault missing either is reported by the play's own
+pre_tasks within seconds, before the run touches the host.
 EOF
 }
 
@@ -76,6 +78,7 @@ done
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
+warn() { printf '    \033[1;33mnote:\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── Preflight ─────────────────────────────────────────────
@@ -86,71 +89,88 @@ step "Preflight"
 [ "$(id -u)" -ne 0 ] || die "do not run this as root -- see the header comment. Run it as the
     login user named in inventory.ini; it calls sudo where it needs to."
 
-# `sudo -v` rather than a later surprise: this script installs packages, and the
-# playbook's become password comes from the vault, so an operator with no sudo rights
-# gets a password prompt loop hundreds of tasks in.
-#
-# It also pins down where this has to be run from. `sudo -v` prompts on a terminal, so
-# with no TTY -- a CI job, `ssh host ./build_cluster.sh`, a pipe -- it fails with
-# "a terminal is required" and this is the message that explains it. The playbook's own
-# --ask-vault-pass has the same requirement, so there is no getting further anyway
-# without both an askpass helper and --vault-password-file.
+# `sudo -v` prompts on a terminal, so with no TTY -- CI, `ssh host ./build_cluster.sh`, a
+# pipe -- it fails with "a terminal is required" and this message explains it. The play's
+# --ask-vault-pass has the same requirement.
 sudo -v || die "this script needs sudo, on a terminal.
     If there is no TTY here (CI, a piped ssh command), sudo cannot prompt: give the
-    operator NOPASSWD or set SUDO_ASKPASS and export SUDO_ASKPASS-aware sudo, and pass
-    --vault-password-file so the vault does not prompt either."
+    operator NOPASSWD or set SUDO_ASKPASS, and pass --vault-password-file so the vault
+    does not prompt either."
 
-# install_ansible.sh has carried a comment about this for a while; on Ubuntu 26.04 it is
-# no longer hypothetical, because sudo-rs is a packaged alternative for /usr/bin/sudo.
 # Ansible's become plugin drives sudo with flags sudo-rs does not implement, and the
-# failure is an opaque "sudo: invalid option" on the first become task.
-if ! sudo --version 2>&1 | head -1 | grep -qi '^sudo version'; then
-  die "/usr/bin/sudo is not the classic sudo (probably sudo-rs), which Ansible cannot
+# failure is an opaque "sudo: invalid option" on the first become task -- which is
+# Gathering Facts, since the play is `become: true` at play level, so no assert inside the
+# play could ever report it.
+#
+# Asked of the binary rather than of a version banner. Sniffing `sudo --version` for
+# "Sudo version" fails closed, which is the right direction, but it makes a wording change
+# upstream brick the documented entry point with a confidently wrong diagnosis. What
+# actually matters is which implementation is behind /usr/bin/sudo.
+sudo_real=$(readlink -f "$(command -v sudo)" 2>/dev/null || echo "")
+case "$sudo_real" in
+  *sudo-rs*) die "/usr/bin/sudo resolves to $sudo_real (sudo-rs), which Ansible cannot
     drive. Switch it with:
         sudo update-alternatives --config sudo
-    or install the classic one: sudo apt install sudo"
-fi
+    or install the classic one: sudo apt install sudo" ;;
+esac
 
 [ -f "$INVENTORY" ] || die "no inventory at $INVENTORY -- is $REPO_ROOT really the checkout?"
 [ -f "$ANSIBLE_DIR/playbook.yml" ] || die "no playbook at $ANSIBLE_DIR/playbook.yml"
 
-# inventory.ini pins ansible_user, and group_vars derives both repo_path and the
-# ~/.kube/config path from it. Running as anyone else builds a cluster whose kubeconfig
-# lands in a home the operator does not own. Checked here rather than discovered as a
-# permissions error 400 tasks in.
-inventory_user=$(sed -n 's/.*ansible_user=\([^ ]*\).*/\1/p' "$INVENTORY" | head -1)
+# inventory.ini pins ansible_user, and the play writes ~/.kube/config into that user's
+# home. Running as anyone else builds a cluster whose kubeconfig the operator does not own.
+#
+# Comment lines skipped, and the value terminated on any whitespace rather than on a
+# space: a commented-out host would otherwise win (`head -1` takes it), and a tab-separated
+# inventory would swallow the rest of the line into the username. Both produce a confident
+# `die` telling you to edit a file that is correct. `ansible-inventory --list` is the exact
+# answer, but it needs the vault password, which is not available this early.
+inventory_user=$(sed -e 's/[;#].*//' -e '/^[[:space:]]*$/d' "$INVENTORY" \
+                 | sed -n 's/.*ansible_user=\([^[:space:]]*\).*/\1/p' | head -1)
 if [ -n "$inventory_user" ] && [ "$inventory_user" != "$(id -un)" ]; then
   die "inventory.ini names ansible_user=$inventory_user but this is $(id -un).
     The kubeconfig and the chart cache are written into that user's home. Either run as
     $inventory_user, or edit $INVENTORY."
 fi
 
-if [ ! -f "$VAULT_FILE" ]; then
-  die "no vault at $VAULT_FILE.
-    The playbook cannot load group_vars without it. Create it with:
-        ansible-vault create $VAULT_FILE
-    and put two keys in it:
-        vault_become_pass: <the sudo password for $(id -un)>
-        vault_argocd_deploy_key: |
-          <private half of a GitHub deploy key with read access to this repo>
-    Generate the key with \`ssh-keygen -t ed25519 -N '' -C argocd -f argocd_deploy_key\`
-    and add the .pub half under the repo's Deploy keys on GitHub. -N '' is not optional:
-    ArgoCD has nowhere to enter a passphrase."
-fi
+[ -f "$VAULT_FILE" ] || die "no vault at $VAULT_FILE.
+    It is tracked in this repo, so this means the checkout is incomplete."
 head -1 "$VAULT_FILE" | grep -q '^\$ANSIBLE_VAULT' \
   || die "$VAULT_FILE is not vault-encrypted. It holds a sudo password and a private key;
     encrypt it with \`ansible-vault encrypt $VAULT_FILE\` before going further."
-info "vault present and encrypted"
+info "vault present and encrypted (its *contents* are checked by the play's pre_tasks)"
 
-case "$(uname -m)" in
-  x86_64)  ARCH=amd64 ;;
-  aarch64) ARCH=arm64 ;;
-  *) die "no pinned crictl/Helm artefact for $(uname -m). Add one to this script and to
-    the vars at the top of playbook.yml." ;;
-esac
-info "architecture $ARCH"
-
-command -v curl >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y curl; }
+# ── Repair a half-configured apt source ───────────────────
+# This has to happen before anything runs `apt update`, and two steps below can:
+# install_ansible.sh opens with one, and so does the curl fallback. An apt refresh
+# validates every configured repository, including the Kubernetes one this repo's own play
+# adds -- so a run that failed after writing kubernetes.list but before the keyring was
+# usable leaves a machine where the *wrapper* cannot get far enough to reach the play that
+# would repair it. The play closes this for itself; this closes it one level up.
+step "Kubernetes apt source"
+if [ -e "$K8S_APT_LIST" ] || [ -e "$K8S_KEYRING" ]; then
+  keyring_ok=0
+  if [ -e "$K8S_KEYRING" ] && sudo gpg --no-default-keyring --keyring "$K8S_KEYRING" \
+       --list-keys --with-colons 2>/dev/null | grep -q '^pub:'; then
+    keyring_ok=1
+  fi
+  if [ "$keyring_ok" -eq 1 ]; then
+    # Valid keyring, possibly unreadable by the unprivileged `_apt` that runs gpgv.
+    if [ "$(stat -c '%a' "$K8S_KEYRING")" != "644" ]; then
+      sudo chmod 0644 "$K8S_KEYRING"
+      info "repaired the mode on $K8S_KEYRING (was unreadable by _apt)"
+    else
+      info "keyring is present and readable"
+    fi
+  else
+    # An empty or malformed keyring cannot be repaired, and leaving the list file pointing
+    # at it makes every apt refresh fail. Remove both; the play recreates them atomically.
+    sudo rm -f "$K8S_KEYRING" "$K8S_APT_LIST"
+    info "removed an unusable keyring and its sources.list entry -- the play recreates them"
+  fi
+else
+  info "not configured yet -- the play will add it"
+fi
 
 # ── Ansible ───────────────────────────────────────────────
 step "Ansible"
@@ -160,112 +180,96 @@ else
   "$REPO_ROOT/infrastructure/scripts/install_ansible.sh"
 fi
 
-# The playbook uses ansible.posix.sysctl and community.general.modprobe. The `ansible`
-# package carries both; `ansible-core` alone does not, and the run then dies on the
-# first of them with "couldn't resolve module/action" -- after swap is already off and
-# fstab is already rewritten. Checked up front, and repaired from Galaxy rather than
-# just reported, because ansible-core is what pip installs by default.
+# The play uses ansible.posix.sysctl and community.general.modprobe. The `ansible` package
+# carries both; `ansible-core` alone does not, and the run dies on the first of them with
+# "couldn't resolve module/action" -- after swap is off and fstab is rewritten.
+#
+# Asked with ansible-doc, which answers the question the play actually cares about (can
+# this module resolve?) rather than parsing `ansible-galaxy collection list`, whose
+# human-readable table -- header, a `# path` line, a `---` rule -- is not a stable
+# interface.
 step "Ansible collections"
-for collection in ansible.posix community.general; do
-  if ansible-galaxy collection list "$collection" 2>/dev/null | grep -q "^$collection "; then
-    info "$collection present"
+for module in ansible.posix.sysctl community.general.modprobe; do
+  if ansible-doc -t module "$module" >/dev/null 2>&1; then
+    info "$module resolves"
   else
-    info "$collection missing -- installing from Galaxy"
+    collection=${module%.*}
+    info "$module does not resolve -- installing $collection from Galaxy"
     ansible-galaxy collection install "$collection"
+    ansible-doc -t module "$module" >/dev/null 2>&1 \
+      || die "$collection installed but $module still does not resolve. Check
+    ANSIBLE_COLLECTIONS_PATH and which ansible-playbook is on PATH ($(command -v ansible-playbook))."
   fi
 done
 
-# ── crictl ────────────────────────────────────────────────
-# Needed by kubeadm reset (which drives the CRI through it and reports success without
-# it), by recover_apiserver.sh, and by destroy_cluster.sh. Not packaged on Ubuntu, and
-# until now only documented in README.md -- so a fresh machine reached teardown before
-# discovering it, which is the worst moment to find out.
-step "crictl"
-if command -v crictl >/dev/null && crictl --version | grep -q "$CRICTL_VERSION"; then
-  info "already at $CRICTL_VERSION"
-else
-  sha_var="CRICTL_SHA256_$ARCH"
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL -o "$tmp/crictl.tar.gz" \
-    "https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-$CRICTL_VERSION-linux-$ARCH.tar.gz"
-  echo "${!sha_var}  $tmp/crictl.tar.gz" | sha256sum -c -
-  sudo tar zxf "$tmp/crictl.tar.gz" -C /usr/local/bin crictl
-  rm -rf "$tmp"
-  trap - EXIT
-  info "installed $(crictl --version)"
-fi
-
 # ── Static checks ─────────────────────────────────────────
-# Renders both halves and asserts the cross-file invariants. Needs helm, which the
-# playbook installs -- so on a genuinely fresh machine this is skipped rather than
-# failed, and the same checks run in CI on every change to the charts anyway.
+# Renders both halves and asserts the cross-file invariants. Needs helm, which the play
+# installs -- so on a genuinely fresh machine this is skipped rather than failed, and CI
+# runs the same checks on every change to the charts.
 if [ "$SKIP_RENDER_CHECK" -eq 0 ]; then
   step "Static checks (check_deployments.sh)"
   if command -v helm >/dev/null; then
     "$REPO_ROOT/infrastructure/scripts/check_deployments.sh"
   else
-    info "helm not installed yet -- skipping; the playbook installs it, re-run to check"
+    info "helm not installed yet -- skipping; the play installs it, re-run to check"
   fi
 fi
 
 # ── The playbook ──────────────────────────────────────────
-# -e repo_path is the fix for the one prerequisite nothing else states. group_vars
-# defaults it to /home/<user>/dev/ai-platform, which is a guess about where the checkout
-# lives: from any other path -- a second clone, a git worktree, /opt -- the play silently
-# reads system-apps/ out of the *guessed* directory and deploys whatever is on disk
-# there, not what you are looking at. Passing the resolved root makes the play deploy the
-# checkout it was launched from.
 step "Running the playbook"
-info "repo_path=$REPO_ROOT"
 cd "$ANSIBLE_DIR"
 ansible-playbook -i inventory.ini playbook.yml \
-  -e "repo_path=$REPO_ROOT" \
   "${VAULT_ARGS[@]}" \
   ${ANSIBLE_EXTRA[@]+"${ANSIBLE_EXTRA[@]}"}
 
-# ── Post-verify ───────────────────────────────────────────
-# The playbook asserts its own steps; this asserts the result as an operator would see
-# it, from the kubeconfig it just installed. Nothing here is a duplicate of a play
-# assert: it is the same questions asked of the finished cluster, so a green play over a
-# cluster that is not actually usable does not read as success.
-step "Verifying the cluster"
+# ── End state ─────────────────────────────────────────────
+# Deliberately short. This used to re-asks five questions the play already blocks on, and
+# got one of them wrong: it waited on deploy/argocd-server, which is precisely the gate the
+# play argues is the wrong one (repo-server does the clone and the applicationset
+# controller does the reconcile, and argocd-redis can lag both on a cold pull), so it would
+# report ok while the components that matter were still starting.
+#
+# What is left is the operator's view of the finished cluster: the two facts worth printing
+# rather than merely asserting, read through the kubeconfig the play just installed. Names
+# come out of the same files the play reads, not restated here -- rename the ApplicationSet
+# or repin the ingress and this follows, instead of failing on a healthy cluster.
+step "End state"
 export KUBECONFIG="$HOME/.kube/config"
 [ -r "$KUBECONFIG" ] || die "the playbook did not leave a readable $KUBECONFIG"
 
+appset_name=$(python3 -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["metadata"]["name"])' "$APPSET_FILE")
+ingress_pin=$(python3 -c '
+import sys, yaml
+v = yaml.safe_load(open(sys.argv[1]))["cilium"]["ingressController"]["service"]["annotations"]
+print(v["lbipam.cilium.io/ips"])' "$CILIUM_VALUES")
+
 verify_fail=0
-check() {
-  local label=$1; shift
-  if out=$("$@" 2>&1); then
-    printf '    ok   %-38s %s\n' "$label" "$(printf '%s' "$out" | head -1)"
-  else
-    printf '    FAIL %-38s %s\n' "$label" "$(printf '%s' "$out" | head -3 | tr '\n' ' ')"
-    verify_fail=1
-  fi
-}
+node_status=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type 2>&1 | tr '\n' ' ')
+printf '    %-22s %s\n' "node" "$node_status"
 
-check "node Ready"            kubectl wait --for=condition=Ready node --all --timeout=120s
-check "cilium agent"          kubectl -n kube-system rollout status ds/cilium --timeout=120s
-check "cilium operator"       kubectl -n kube-system rollout status deploy/cilium-operator --timeout=120s
-check "argocd server"         kubectl -n argocd rollout status deploy/argocd-server --timeout=120s
-check "applicationset generator" kubectl -n argocd wait --for=condition=ResourcesUpToDate \
-      applicationset/deployment-appset --timeout=120s
-
-# The ingress address is the one thing a green play can still get wrong in a way nothing
-# else reports, and the answer is worth printing rather than merely asserting -- it is the
-# A record every Ingress in the cluster resolves to.
-ingress_ip=$(kubectl -n kube-system get service cilium-ingress \
-               -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-if [ -n "$ingress_ip" ]; then
-  printf '    ok   %-38s %s\n' "ingress address" "$ingress_ip"
+appset_ready=$(kubectl -n argocd get applicationset "$appset_name" \
+                 -o jsonpath='{.status.conditions[?(@.type=="ResourcesUpToDate")].status}' 2>&1 || true)
+if [ "$appset_ready" = "True" ]; then
+  printf '    %-22s %s\n' "applicationset" "$appset_name ResourcesUpToDate"
 else
-  printf '    FAIL %-38s %s\n' "ingress address" "cilium-ingress has none -- LB-IPAM could not serve the pin"
+  printf '    %-22s %s\n' "applicationset" "FAIL: $appset_name is not ResourcesUpToDate ($appset_ready)"
   verify_fail=1
 fi
 
-if [ "$verify_fail" -ne 0 ]; then
-  die "the playbook finished but the cluster does not check out -- see the FAILs above."
+# Compared against the pin, not merely checked for existence. #35 added a CI assert that
+# the pinned address sits inside the LoadBalancer pool; this is the cluster-side half of
+# the same claim -- an address that is not the pinned one means every ingress A record is
+# wrong, which "has an address" would pass.
+ingress_ip=$(kubectl -n kube-system get service cilium-ingress \
+               -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+if [ "$ingress_ip" = "$ingress_pin" ]; then
+  printf '    %-22s %s\n' "ingress" "$ingress_ip"
+else
+  printf '    %-22s %s\n' "ingress" "FAIL: serving '${ingress_ip:-<none>}', values.yaml pins $ingress_pin"
+  verify_fail=1
 fi
+
+[ "$verify_fail" -eq 0 ] || die "the playbook finished but the cluster does not check out."
 
 step "Cluster is up"
 cat <<EOF
