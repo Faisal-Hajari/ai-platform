@@ -1,5 +1,4 @@
 ansible_become_pass: "{{ vault_become_pass }}"
-repo_path: "/home/{{ ansible_user }}/dev/ai-platform"
 
 # Private half of a GitHub deploy key with read access to this repo, which ArgoCD needs to
 # clone the SSH remote in argocd/applicationset.yaml. Defaulted to empty rather than left

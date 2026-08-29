@@ -34,6 +34,24 @@ resources that are already there.
 
 ## Bootstrap
 
+On a fresh machine, one command:
+
+```bash
+./infrastructure/scripts/build_cluster.sh
+```
+
+It installs the two things that cannot be Ansible tasks — Ansible itself and its two
+collections — checks what the play would otherwise discover hundreds of tasks in, runs the
+play, and prints the finished cluster's end state. Everything else the node needs,
+`crictl` included, is a task in the play.
+
+`group_vars/k8s-master/vault.yml` is tracked here, so a clone already has the file; what
+it cannot supply is the contents. It must hold `vault_become_pass` and
+`vault_argocd_deploy_key`, and a vault missing either is reported by the play's own
+`pre_tasks` within seconds, before the run touches the host.
+
+The two commands it wraps, if you would rather run them by hand:
+
 ```bash
 ./infrastructure/scripts/install_ansible.sh
 cd infrastructure/k8s-ansible
@@ -44,11 +62,15 @@ ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass
 `ansible_become_pass` from the vault-encrypted `vault.yml` beside it, so the run cannot
 load group_vars without the secret. `--vault-password-file` works too.
 
-`repo_path` is the repository root, which the play reads `system-apps/` out of — the
-Cilium chart it installs with Helm, its LoadBalancer configuration, and the
-ApplicationSet. It already defaults to `/home/{{ ansible_user }}/dev/ai-platform` in
-`group_vars/k8s-master/vars.yml`; pass `-e repo_path=...` only if the checkout lives
-somewhere else.
+The play locates `system-apps/` relative to itself, via Ansible's `playbook_dir` — the
+directory holding `playbook.yml`, which `system-apps/` sits beside. There is nothing to
+pass and nothing to configure.
+
+It used to read a `repo_path` variable that `group_vars/` defaulted to
+`/home/{{ ansible_user }}/dev/ai-platform`. That was a *guess* about where the checkout
+lives, and a wrong guess was silent: run the play from a second clone, `/opt`, or a git
+worktree and it read `system-apps/` out of the guessed directory and deployed whatever was
+on disk there rather than the tree you were looking at. No task compared the two.
 
 Re-running the play is also the *only* update path for anything under `system-apps/`:
 nothing reconciles behind it, and `helm upgrade --install` corrects drift on every run.
@@ -66,7 +88,7 @@ editing these — nothing discovers them at run time.
 | Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Must sit inside the pool below |
 | LoadBalancer pool | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope |
 | NIC name (`eno1`) | [`system-apps/cilium/config/l2-policy.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses |
-| Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible; `repo_path` in `group_vars/` is derived from it |
+| Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible, and the home the kubeconfig and the chart cache are written into |
 
 The API server address and the pod CIDR used to be written twice each — once for Cilium
 and once for kubeadm — and agreed only because nobody had changed one of them. They are
@@ -98,29 +120,22 @@ Each script carries a shebang and is executable, so run it directly.
 | `check_deployments.sh` | Renders every chart in `system-apps/` and `deployment/` the way its deployer will and asserts the invariants that have bitten this cluster before. Run before pushing changes to either. |
 | `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Fix `k8sServiceHost` in `values.yaml` and re-run the playbook afterwards — the patches are a stopgap, and the playbook is now the only thing that renders Cilium. |
 | `recover_apiserver.sh` | Clears a static pod wedged in `CreateContainerError` after a backward clock step. Needs root and `crictl`. |
-| `nuke_cluster.sh` | Tears the cluster down far enough for the playbook to rebuild it, including the Cilium node-local state `kubeadm reset` leaves behind. Needs root and `crictl`. |
+| `build_cluster.sh` | Builds the cluster from a fresh machine: installs Ansible and its collections, repairs a half-configured apt source if an earlier run left one, runs the playbook, then prints the finished cluster's end state. Run as the login user, not with `sudo`. |
+| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning — then asserts the machine is actually clean. `--keep-packages` stops at the reset-and-clear-node-state line instead, leaving the packages and host tuning for the playbook to rebuild onto. Leaves Ansible, chrony and Docker alone. Run as the login user, not with `sudo`. |
 
 ### crictl
 
-`nuke_cluster.sh` and `recover_apiserver.sh` need `crictl`, and `kubeadm reset` drives the
-CRI through it — without it the reset reports success while leaving containers running.
-It is not packaged on Ubuntu; install it from cri-tools.
+`recover_apiserver.sh` and `destroy_cluster.sh` both need `crictl`, and
+`kubeadm reset` drives the CRI through it — without it the reset reports success while
+leaving containers running. It is not packaged on Ubuntu.
 
-Pinned to a version and to the SHA256 of the release artefact itself, on the same
-reasoning as the Helm pin in `playbook.yml`: the checksum is what makes
-the version mean anything, and it is per version and per architecture, so bumping
-`VERSION` means replacing both digests. Only amd64 and arm64 are pinned — on anything
-else `ARCH` stays unset, the download 404s, and the chain stops before `sudo tar`.
+**The playbook installs it**, from a version and per-architecture SHA256 pinned in its
+`vars:` block beside the Helm pin, and on the same reasoning: the checksum is what makes
+the version mean anything, so bumping `crictl_version` means replacing both digests. Only
+amd64 and arm64 are pinned; anything else fails the play's architecture assert rather than
+installing something unverified.
 
-```bash
-VERSION=v1.31.1
-case "$(uname -m)" in
-  x86_64)  ARCH=amd64  SHA256=0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231 ;;
-  aarch64) ARCH=arm64  SHA256=cd70f9b2f75c9619f40450d4b6e2c74aaab619917da517eff6787b442f8b0e56 ;;
-esac
-
-curl -fsSL -o crictl.tar.gz "https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-$ARCH.tar.gz" &&
-  echo "$SHA256  crictl.tar.gz" | sha256sum -c - &&
-  sudo tar zxf crictl.tar.gz -C /usr/local/bin crictl
-rm -f crictl.tar.gz
-```
+That pin is the only copy. It was briefly stated three times — here, in `build_cluster.sh`
+and in the play — with nothing keeping them in step; the script's bash reimplementation of
+the play's own pinned-download block is gone, and this section no longer restates the
+digests.

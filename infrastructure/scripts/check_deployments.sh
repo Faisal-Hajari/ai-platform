@@ -245,4 +245,103 @@ else
   fail=1
 fi
 
+# The apt-source ordering invariant in playbook.yml -- a cross-file-shaped problem living
+# inside one file: an ordering relationship between two tasks hundreds of lines apart,
+# where neither looks wrong on its own.
+#
+# `gpg --dearmor` writes the Kubernetes keyring 0600 and apt runs gpgv as the unprivileged
+# `_apt`, so until the mode task has run the repository verifies as unsigned. An apt
+# refresh validates EVERY configured source, so any `update_cache: true` that runs before
+# that task takes the whole play down -- and re-running cannot fix it, because the repair
+# is downstream of the thing that fails. Three separate attempts at this each moved the
+# error earlier in the play rather than removing it, which is what makes it worth a check
+# rather than a comment.
+echo "==> infrastructure/k8s-ansible/playbook.yml"
+if apt_order_errors=$(python3 - 2>&1 <<'APTPY'
+import pathlib, re, sys
+
+lines = pathlib.Path("infrastructure/k8s-ansible/playbook.yml").read_text().splitlines()
+REPAIR = "Make the Kubernetes apt key readable by _apt"
+
+repair = [i for i, l in enumerate(lines, 1)
+          if re.match(r"\s*- name:\s*" + re.escape(REPAIR) + r"\s*$", l)]
+# Two spellings, because a check that only knows one is a check that a future edit walks
+# past. YAML's booleans are not just `true` -- Ansible accepts yes/on/True/YES equally --
+# and the module can also be written inline as `apt: name=curl update_cache=yes`, which is
+# exactly the terser form someone reaches for when adding a quick task. Nothing in this
+# repo uses the inline spelling today; it is here so that "today" is not load-bearing.
+#
+# What this still cannot see, stated so the check is honest about its own reach: a value
+# supplied by a variable (`update_cache: "{{ refresh }}"`), a refresh performed by
+# something other than the apt module (`command: apt-get update`, `apt_repository` with
+# update_cache), and anything in a file this does not read, since the play is a single
+# file with no includes. Each would need a different check; none is reachable by grep.
+#
+# Comment lines are skipped, and that is not cosmetic. The colon branch is anchored
+# (`match` ... `$`), so prose cannot trip it; the inline branch has to be an unanchored
+# `search` to find `update_cache=yes` mid-line, which means a comment *mentioning* the
+# inline spelling matches. The apt-sources block in that play is several paragraphs of
+# prose about update_cache, so the failure a maintainer hits is: document the inline form
+# above the repair task -- exactly what the comment here suggests someone might do -- and
+# CI goes red asserting an ordering bug that does not exist. A check whose message is a
+# confident description of a specific bug has to be right about it.
+BOOL = r"(true|yes|on)"
+# Three spellings, because the anchored block form alone missed the one this repo is most
+# likely to write. `\s*$` means any trailing content breaks the match -- including the
+# trailing annotation nearly every setting in this play carries:
+#
+#     update_cache: true  # make sure the lists are fresh     <- passed green
+#
+# That is a real task, ahead of the repair, reintroducing the exact bug this check exists
+# for. An optional trailing comment closes it, and it is safe to anchor that loosely here
+# because the value is a boolean: there is no quoted string that could legitimately hold a
+# `#`, which is the usual reason not to split YAML on one.
+#
+# The third branch is the flow-mapping spelling (`apt: {name: foo, update_cache: true}`),
+# which the anchored form cannot see either. It requires the mapping punctuation on both
+# sides, so it cannot match prose even if the comment skip above ever stopped applying.
+#
+# Still not seen, so the check's reach stays documented rather than assumed: a value
+# supplied by a variable (`update_cache: "{{ refresh }}"`), a refresh performed by
+# something other than the apt module (`command: apt-get update`, `apt_repository`), and
+# anything outside this one file, since the play has no includes.
+BLOCK  = r"\s*update_cache:\s*" + BOOL + r"\s*(#.*)?$"
+INLINE = r"\bupdate_cache\s*=\s*" + BOOL + r"\b"
+FLOW   = r"[{,]\s*update_cache\s*:\s*" + BOOL + r"\s*[,}]"
+refresh = [i for i, l in enumerate(lines, 1)
+           if not l.lstrip().startswith("#")
+           and (re.match(BLOCK, l, re.I)
+                or re.search(INLINE, l, re.I)
+                or re.search(FLOW, l, re.I))]
+
+errors = []
+if not repair:
+    errors.append("no task named %r -- the keyring is never made readable by _apt, so"
+                  " every apt refresh rejects the Kubernetes repo as unsigned" % REPAIR)
+elif len(repair) > 1:
+    errors.append("%r appears %d times (lines %s); this check assumes one"
+                  % (REPAIR, len(repair), repair))
+else:
+    early = [n for n in refresh if n < repair[0]]
+    if early:
+        errors.append(
+            "an apt cache refresh at line(s) %s runs before %r at line %d. An apt refresh"
+            " validates every configured repository, so on any machine that already has"
+            " kubernetes.list this fails before the play can repair the keyring -- and"
+            " re-running cannot help. Move the apt-source block ahead of the first"
+            " refresh, or drop update_cache from the earlier task."
+            % (early, REPAIR, repair[0]))
+
+print("\n".join(errors))
+sys.exit(1 if errors else 0)
+APTPY
+); then
+  echo "    ok"
+else
+  while IFS= read -r line; do
+    echo "    FAIL: $line"
+  done <<<"$apt_order_errors"
+  fail=1
+fi
+
 exit "$fail"
