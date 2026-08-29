@@ -359,9 +359,13 @@ done
 # rdepends output as headings rather than as real dependants.
 #
 # awk rather than `grep -v ... || true`: `|| true` makes "the filter errored" look identical
-# to "nothing depends on it", and it fails towards purging. Not hypothetical -- Ubuntu 26.04
-# ships ugrep as /usr/bin/grep, and ugrep rejects the empty alternation `(...|)$` that GNU
-# grep accepts, so the first draft of this reported no dependants on a box that had some.
+# to "nothing depends on it", and it fails towards purging -- the wrong direction for a
+# decision that can take Docker's runtime with it. That reasoning stands on its own; the
+# empty alternation `(...|)$` in the first draft of this line is a portability landmine
+# (ugrep rejects what GNU grep accepts) rather than a bug that ever fired here, since a
+# script gets /usr/bin/grep, which is GNU. An earlier version of this comment claimed
+# otherwise, from a `grep --version` run in an interactive shell that had a `grep` function
+# in front of the binary -- see the retraction note below the swap step.
 if installed containerd; then
   provides=$(apt-cache showpkg containerd 2>/dev/null \
     | sed -n '/Reverse Provides:/,$p' | awk 'NR > 1 && NF { print $1 }' | sort -u)
