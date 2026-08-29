@@ -265,8 +265,12 @@ REPAIR = "Make the Kubernetes apt key readable by _apt"
 
 repair = [i for i, l in enumerate(lines, 1)
           if re.match(r"\s*- name:\s*" + re.escape(REPAIR) + r"\s*$", l)]
+# YAML's booleans are not just `true`: Ansible accepts yes/on/True/YES equally, so a
+# future task written `update_cache: yes` ahead of the repair would sail past a check
+# that only knew the lowercase spelling -- reintroducing precisely the bug this exists
+# to catch, while the check stayed green.
 refresh = [i for i, l in enumerate(lines, 1)
-           if re.match(r"\s*update_cache:\s*true\s*$", l)]
+           if re.match(r"\s*update_cache:\s*(true|yes|on)\s*$", l, re.I)]
 
 errors = []
 if not repair:

@@ -334,6 +334,7 @@ installed() {
   dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | awk '$3 == "installed" { found = 1 } END { exit !found }'
 }
 
+containerd_kept=0
 purge=()
 for pkg in kubelet kubeadm kubectl kubernetes-cni; do
   installed "$pkg" && purge+=("$pkg")
@@ -377,6 +378,12 @@ if installed containerd; then
   if [ -z "${real_dependants// /}" ]; then
     purge+=(containerd)
   else
+    # Recorded, not just printed. The verification block at the end asserts containerd is
+    # gone, and this is the one path on which its still being here is correct -- so a
+    # fully successful teardown on a Docker box would otherwise end with
+    # "STILL HERE containerd" and exit 1, failing in exactly the scenario this branch
+    # exists to handle.
+    containerd_kept=1
     warn "containerd is left installed -- these installed packages depend on it:$real_dependants"
   fi
 fi
@@ -503,16 +510,31 @@ absent() {
     printf '    %-12s %s (%s)\n' "STILL HERE" "$1" "$(command -v "$1")"; clean=0
   else printf '    %-12s %s\n' "gone" "$1"; fi
 }
-for b in kubeadm kubelet kubectl containerd helm crictl; do absent "$b"; done
-for d in /etc/kubernetes /var/lib/etcd /var/lib/kubelet /etc/cni/net.d /opt/cni \
-         /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf \
-         /etc/apt/sources.list.d/kubernetes.list \
-         /etc/apt/keyrings/kubernetes-apt-keyring.gpg \
-         /etc/systemd/system/kubelet.service.d/10-time-sync.conf \
-         /etc/systemd/system/containerd.service.d/10-time-sync.conf \
-         "$TARGET_HOME/.kube"; do
-  gone "$d"
-done
+binaries=(kubeadm kubelet kubectl helm crictl)
+paths=(/etc/kubernetes /var/lib/etcd /var/lib/kubelet /etc/cni/net.d /opt/cni
+       /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf
+       /etc/apt/sources.list.d/kubernetes.list
+       /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+       /etc/systemd/system/kubelet.service.d/10-time-sync.conf
+       /etc/systemd/system/containerd.service.d/10-time-sync.conf
+       "$TARGET_HOME/.kube")
+if [ "$containerd_kept" -eq 0 ]; then
+  binaries+=(containerd)
+  paths+=(/var/lib/containerd /etc/containerd)
+else
+  info "containerd was deliberately left installed, so it and its state are not checked"
+fi
+for b in "${binaries[@]}"; do absent "$b"; done
+for d in "${paths[@]}"; do gone "$d"; done
+
+# /root is 0700, so a plain `[ -e ]` as the login user reports "gone" for a directory that
+# is still there -- a false pass on exactly the leftover the header calls out as turning
+# the next build's first kubectl into an x509 mystery.
+if sudo test -e /root/.kube; then
+  printf '    %-12s %s\n' "STILL HERE" "/root/.kube"; clean=0
+else
+  printf '    %-12s %s\n' "gone" "/root/.kube"
+fi
 if ip -br link show 2>/dev/null | grep -q '^cilium'; then
   printf '    %-12s %s\n' "STILL HERE" "cilium network interfaces"; clean=0
 fi

@@ -140,6 +140,19 @@ head -1 "$VAULT_FILE" | grep -q '^\$ANSIBLE_VAULT' \
     encrypt it with \`ansible-vault encrypt $VAULT_FILE\` before going further."
 info "vault present and encrypted (its *contents* are checked by the play's pre_tasks)"
 
+# Checked here rather than discovered at the end. The end-state block reads the
+# ApplicationSet name and the ingress pin out of YAML with PyYAML, and that runs *after*
+# the play has succeeded -- so on a box without it a working cluster ends this script with
+# a ModuleNotFoundError under `set -e`. check_deployments.sh would normally surface it
+# earlier, but on a fresh machine that is skipped for want of helm, so this is the first
+# use. CI installs PyYAML explicitly, which is a good sign it should not be assumed here.
+if python3 -c 'import yaml' 2>/dev/null; then
+  info "PyYAML present"
+else
+  info "installing python3-yaml (the end-state check reads the charts with it)"
+  sudo apt-get install -y python3-yaml
+fi
+
 # ── Repair a half-configured apt source ───────────────────
 # This has to happen before anything runs `apt update`, and two steps below can:
 # install_ansible.sh opens with one, and so does the curl fallback. An apt refresh
@@ -244,8 +257,16 @@ v = yaml.safe_load(open(sys.argv[1]))["cilium"]["ingressController"]["service"][
 print(v["lbipam.cilium.io/ips"])' "$CILIUM_VALUES")
 
 verify_fail=0
-node_status=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type 2>&1 | tr '\n' ' ')
-printf '    %-22s %s\n' "node" "$node_status"
+# Quoted, and reading the Ready condition's *status* rather than its type. The previous
+# form was `custom-columns=...,STATUS:.status.conditions[-1].type`, wrong twice: `[-1].type`
+# is the string "Ready" -- the condition's name, printed identically for a NotReady node --
+# and unquoted it is a glob, which zsh treats as a fatal "no matches found" rather than
+# passing through as bash does, so the line did not run at all under zsh.
+# destroy_cluster.sh already codifies that glob rule for its own `find`.
+node_ready=$(kubectl get nodes --no-headers \
+  -o "custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=='Ready')].status" \
+  2>&1 | tr '\n' ' ')
+printf '    %-22s %s\n' "node Ready" "$node_ready"
 
 appset_ready=$(kubectl -n argocd get applicationset "$appset_name" \
                  -o jsonpath='{.status.conditions[?(@.type=="ResourcesUpToDate")].status}' 2>&1 || true)

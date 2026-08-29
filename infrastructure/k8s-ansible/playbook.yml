@@ -348,16 +348,34 @@
     # is gpg's machine-readable format and distinguishes all four cases (valid, empty,
     # malformed, absent).
     #
+    # `[ -s ]` first, to short-circuit before gpg runs: pointed at a path that does not
+    # exist, `gpg --keyring` *creates* a 32-byte empty keyring as a side effect. Harmless
+    # once the guard reads content rather than existence -- the next run re-downloads --
+    # but it means a failed download leaves an unusable keyring at the real path, which
+    # every apt refresh then rejects until a later run succeeds. Not probing an
+    # absent-or-empty file avoids manufacturing that state at all.
+    #
     # mktemp + mv makes the install atomic, so a failed download cannot leave a partial
     # keyring for the next run to trip over; the temp file is created alongside the target
-    # so the mv is a rename within one filesystem. The mode is set here as well as by the
+    # so the mv is a rename within one filesystem.
+    #
+    # `set -euo pipefail`, not `set -o pipefail`. Without -e the verification below is
+    # inert: a 403 fails the pipeline, the `grep -q '^pub:'` check returns 1 and is
+    # ignored, and chmod/mv/`echo INSTALLED` all run anyway -- so a zero-byte keyring is
+    # installed at the real path, atomically, and the task reports `changed`. The content
+    # guard above still recovers on the next run, so this is not the permanent wedge
+    # `creates:` produced, but within the run it converts a clean failure here into
+    # `E: The repository ... is not signed` at the first update_cache, which is the exact
+    # error the ordering of this block exists to eliminate. The `if` guard is exempt from
+    # -e, so the UNCHANGED path is unaffected, and the trap clears the temp file. The mode is set here as well as by the
     # task below -- here so the file is never briefly readable-only-by-root at the moment
     # apt might look, there so a keyring from an older revision of this play is repaired.
     - name: Add Kubernetes apt key
       shell: |
-        set -o pipefail
+        set -euo pipefail
         keyring=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
-        if gpg --no-default-keyring --keyring "$keyring" --list-keys --with-colons 2>/dev/null \
+        if [ -s "$keyring" ] \
+           && gpg --no-default-keyring --keyring "$keyring" --list-keys --with-colons 2>/dev/null \
              | grep -q '^pub:'; then
           echo UNCHANGED
           exit 0
@@ -601,6 +619,87 @@
       systemd:
         daemon_reload: true
 
+    # ── Release architecture ──────────────────────────────
+    # Shared by the crictl block below and the Helm block further down, and resolved here
+    # because crictl now has to be installed before the cluster exists. A missing key
+    # leaves this undefined rather than raising, so the assert can say which architecture
+    # had no pinned checksum instead of failing inside Jinja.
+    - name: Resolve the release architecture
+      set_fact:
+        release_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] | default('') }}"
+
+    - name: Assert the architecture has a pinned checksum
+      assert:
+        that: release_arch != ''
+        fail_msg: >-
+          No pinned Helm checksum for {{ ansible_facts['architecture'] }}; add one to
+          the vars at the top of this play.
+        success_msg: "pinning the {{ release_arch }} artefact"
+
+
+    # ── crictl ────────────────────────────────────────────
+    # Ahead of `kubeadm init`, deliberately. crictl is what `kubeadm reset` drives the CRI
+    # through, so it is a prerequisite for tearing this cluster down -- and
+    # destroy_cluster.sh hard-refuses without it. Installed after the cluster was created,
+    # any failure in between (the Helm download, a checksum mismatch, a network blip, an
+    # interrupted run) left a machine that had a cluster and could not tear it down with
+    # the tooling this repo provides. Nothing here needs a running cluster, so there is no
+    # reason to be downstream of one.
+    # Same shape as Helm above and deliberately beside it, sharing release_arch and the
+    # pinned-checksum assert rather than restating them. Needed by `kubeadm reset`, by
+    # recover_apiserver.sh and by destroy_cluster.sh; the teardown checks for it in
+    # preflight and refuses rather than performing a reset that silently does nothing.
+    #
+    # Version-matched, not merely present: `crictl --version` is compared exactly, because
+    # a substring test accepts v1.31.10 for a v1.31.1 pin and would leave the wrong binary
+    # in place while reporting the pinned one.
+    - name: Check the installed crictl version
+      command: crictl --version
+      register: crictl_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install the pinned crictl release
+      when: crictl_installed.stdout | default('') | trim != 'crictl version ' ~ crictl_version
+      block:
+        - name: Create a scratch directory for the crictl download
+          tempfile:
+            state: directory
+            suffix: crictl
+          register: crictl_tmp
+
+        - name: Download the pinned crictl release
+          get_url:
+            url: >-
+              https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-{{ release_arch }}.tar.gz
+            dest: "{{ crictl_tmp.path }}/crictl.tar.gz"
+            checksum: sha256:{{ crictl_sha256[release_arch] }}
+            mode: '0644'
+
+        # The tarball holds the binary alone, but unpack to the scratch directory anyway
+        # so nothing lands in /usr/local/bin unless the checksum above passed.
+        - name: Unpack crictl
+          unarchive:
+            src: "{{ crictl_tmp.path }}/crictl.tar.gz"
+            dest: "{{ crictl_tmp.path }}"
+            remote_src: true
+
+        - name: Install the crictl binary
+          copy:
+            src: "{{ crictl_tmp.path }}/crictl"
+            dest: /usr/local/bin/crictl
+            remote_src: true
+            owner: root
+            group: root
+            mode: '0755'
+
+      always:
+        - name: Remove the crictl scratch directory
+          file:
+            path: "{{ crictl_tmp.path }}"
+            state: absent
+          when: crictl_tmp.path is defined
+
     # ── Cluster init ──────────────────────────────────────
     # --pod-network-cidr must stay disjoint from --service-cluster-ip-range, left at the
     # kubeadm default 10.96.0.0/12. Fixed at init time: changing it later needs a rebuild.
@@ -696,18 +795,6 @@
     #
     # A missing key leaves this undefined rather than raising, so the assert below can
     # say which architecture had no pinned checksum instead of failing inside Jinja.
-    - name: Resolve the release architecture
-      set_fact:
-        release_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] | default('') }}"
-
-    - name: Assert the architecture has a pinned checksum
-      assert:
-        that: release_arch != ''
-        fail_msg: >-
-          No pinned Helm checksum for {{ ansible_facts['architecture'] }}; add one to
-          the vars at the top of this play.
-        success_msg: "pinning the {{ release_arch }} artefact"
-
     - name: Check the installed Helm version
       command: helm version --short
       register: helm_installed
@@ -753,62 +840,6 @@
             path: "{{ helm_tmp.path }}"
             state: absent
           when: helm_tmp.path is defined
-
-    # ── crictl ────────────────────────────────────────────
-    # Same shape as Helm above and deliberately beside it, sharing release_arch and the
-    # pinned-checksum assert rather than restating them. Needed by `kubeadm reset`, by
-    # recover_apiserver.sh and by destroy_cluster.sh; the teardown checks for it in
-    # preflight and refuses rather than performing a reset that silently does nothing.
-    #
-    # Version-matched, not merely present: `crictl --version` is compared exactly, because
-    # a substring test accepts v1.31.10 for a v1.31.1 pin and would leave the wrong binary
-    # in place while reporting the pinned one.
-    - name: Check the installed crictl version
-      command: crictl --version
-      register: crictl_installed
-      changed_when: false
-      failed_when: false
-
-    - name: Install the pinned crictl release
-      when: crictl_installed.stdout | default('') | trim != 'crictl version ' ~ crictl_version
-      block:
-        - name: Create a scratch directory for the crictl download
-          tempfile:
-            state: directory
-            suffix: crictl
-          register: crictl_tmp
-
-        - name: Download the pinned crictl release
-          get_url:
-            url: >-
-              https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-{{ release_arch }}.tar.gz
-            dest: "{{ crictl_tmp.path }}/crictl.tar.gz"
-            checksum: sha256:{{ crictl_sha256[release_arch] }}
-            mode: '0644'
-
-        # The tarball holds the binary alone, but unpack to the scratch directory anyway
-        # so nothing lands in /usr/local/bin unless the checksum above passed.
-        - name: Unpack crictl
-          unarchive:
-            src: "{{ crictl_tmp.path }}/crictl.tar.gz"
-            dest: "{{ crictl_tmp.path }}"
-            remote_src: true
-
-        - name: Install the crictl binary
-          copy:
-            src: "{{ crictl_tmp.path }}/crictl"
-            dest: /usr/local/bin/crictl
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0755'
-
-      always:
-        - name: Remove the crictl scratch directory
-          file:
-            path: "{{ crictl_tmp.path }}"
-            state: absent
-          when: crictl_tmp.path is defined
 
     # ── Cilium CNI ────────────────────────────────────────
     # The chart is an umbrella over the upstream cilium chart, and charts/ and Chart.lock
