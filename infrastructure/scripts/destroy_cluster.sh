@@ -418,8 +418,10 @@ fi
 # accumulates binaries from every CNI the node has ever run -- this one still held calico's
 # from before Cilium. Purging the package leaves those.
 #
-# `if`, not `[ -d ] && { ... }`: under `set -e` a bare AND-list at statement level takes its
-# status from the test, so an already-absent /opt/cni would end the run here.
+# `if` rather than `[ -d ] && { ... }` for legibility, not for correctness: `set -e`
+# exempts a command that fails inside an AND-list, so the bare form does not end the run
+# mid-script. It only bites as the last statement of a script or function, where the
+# list's non-zero status becomes the enclosing status. Neither applies here.
 if [ -d /opt/cni ]; then
   sudo rm -rf /opt/cni
   info "removed /opt/cni"
@@ -430,9 +432,11 @@ sudo rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes-
 info "removed the Kubernetes apt list and keyring"
 
 # ── Binaries the playbook installed by hand ───────────────
-# `if` for the same `set -e` reason as /opt/cni above: /usr/local/bin/crictl is the last
-# iteration, so on a machine where it is already gone the test returned 1, the loop returned
-# 1, and the script ended here -- silently skipping every step below.
+# `if` for the same legibility reason as /opt/cni above. An earlier revision of this
+# comment claimed the bare `[ -e ] && { ... }` form ended the run when crictl was already
+# absent -- that was asserted from reasoning and is wrong: `set -e` exempts a failing
+# command inside an AND-list, and this loop is not the script's last statement either way.
+# The rewrite was worth keeping, the diagnosis was not.
 step "Helm and crictl"
 for bin in /usr/local/bin/helm /usr/local/bin/crictl; do
   if [ -e "$bin" ]; then
