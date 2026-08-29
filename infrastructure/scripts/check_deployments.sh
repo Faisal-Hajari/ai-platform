@@ -286,10 +286,33 @@ repair = [i for i, l in enumerate(lines, 1)
 # CI goes red asserting an ordering bug that does not exist. A check whose message is a
 # confident description of a specific bug has to be right about it.
 BOOL = r"(true|yes|on)"
+# Three spellings, because the anchored block form alone missed the one this repo is most
+# likely to write. `\s*$` means any trailing content breaks the match -- including the
+# trailing annotation nearly every setting in this play carries:
+#
+#     update_cache: true  # make sure the lists are fresh     <- passed green
+#
+# That is a real task, ahead of the repair, reintroducing the exact bug this check exists
+# for. An optional trailing comment closes it, and it is safe to anchor that loosely here
+# because the value is a boolean: there is no quoted string that could legitimately hold a
+# `#`, which is the usual reason not to split YAML on one.
+#
+# The third branch is the flow-mapping spelling (`apt: {name: foo, update_cache: true}`),
+# which the anchored form cannot see either. It requires the mapping punctuation on both
+# sides, so it cannot match prose even if the comment skip above ever stopped applying.
+#
+# Still not seen, so the check's reach stays documented rather than assumed: a value
+# supplied by a variable (`update_cache: "{{ refresh }}"`), a refresh performed by
+# something other than the apt module (`command: apt-get update`, `apt_repository`), and
+# anything outside this one file, since the play has no includes.
+BLOCK  = r"\s*update_cache:\s*" + BOOL + r"\s*(#.*)?$"
+INLINE = r"\bupdate_cache\s*=\s*" + BOOL + r"\b"
+FLOW   = r"[{,]\s*update_cache\s*:\s*" + BOOL + r"\s*[,}]"
 refresh = [i for i, l in enumerate(lines, 1)
            if not l.lstrip().startswith("#")
-           and (re.match(r"\s*update_cache:\s*" + BOOL + r"\s*$", l, re.I)
-                or re.search(r"\bupdate_cache\s*=\s*" + BOOL + r"\b", l, re.I))]
+           and (re.match(BLOCK, l, re.I)
+                or re.search(INLINE, l, re.I)
+                or re.search(FLOW, l, re.I))]
 
 errors = []
 if not repair:
