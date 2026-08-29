@@ -258,25 +258,6 @@ sudo rm -rf /root/.kube
 rm -rf "$TARGET_HOME/.kube"
 info "removed /root/.kube and $TARGET_HOME/.kube"
 
-# Gitignored `helm dependency update` output, pinned to the chart version that was current
-# when it was resolved. Clearing it is what makes the next build fetch what Chart.yaml
-# actually declares.
-step "Helm chart cache in the checkout"
-if [ -d "$SYSTEM_APPS" ]; then
-  # No `|| true` swallowing the result: a cache left root-owned by a run someone did with
-  # sudo fails here, and reporting "cleared" over that is how the next build ends up
-  # rendering a stale chart.
-  if find "$SYSTEM_APPS" -mindepth 2 -maxdepth 2 \
-       \( -name charts -type d -o -name Chart.lock -type f \) -exec rm -rf {} + 2>/dev/null; then
-    info "cleared charts/ and Chart.lock under system-apps/"
-  else
-    warn "could not fully clear the chart cache under $SYSTEM_APPS -- check ownership (a
-    run done with sudo leaves it root-owned). The next build may render a stale chart."
-  fi
-else
-  warn "no $SYSTEM_APPS -- nothing to clear"
-fi
-
 restart_containerd() {
   if ! systemctl list-unit-files containerd.service >/dev/null 2>&1; then
     warn "containerd is not installed -- nothing to restart"
@@ -304,6 +285,31 @@ if [ "$KEEP_PACKAGES" -eq 1 ]; then
         ./infrastructure/scripts/build_cluster.sh
 EOF
   exit 0
+fi
+
+# Cleared only on a full destroy -- deliberately below the --keep-packages exit above.
+# That flag exists so the play can rebuild, and the play's cache check stats for the exact
+# `<name>-<version>.tgz` its Chart.yaml declares, so the cache already invalidates itself
+# when a dependency version changes. Wiping it otherwise only makes every rebuild need
+# helm.cilium.io reachable. nuke_cluster.sh left it in place for that reason; matching it
+# here is what makes --keep-packages a strict superset of that script.
+#
+# On a full destroy it goes: the next build is meant to be a fresh-machine build, and a
+# resolved cache pinned to whatever was current when it was written is not that.
+step "Helm chart cache in the checkout"
+if [ -d "$SYSTEM_APPS" ]; then
+  # No `|| true` swallowing the result: a cache left root-owned by a run someone did with
+  # sudo fails here, and reporting "cleared" over that is how the next build ends up
+  # rendering a stale chart.
+  if find "$SYSTEM_APPS" -mindepth 2 -maxdepth 2 \
+       \( -name charts -type d -o -name Chart.lock -type f \) -exec rm -rf {} + 2>/dev/null; then
+    info "cleared charts/ and Chart.lock under system-apps/"
+  else
+    warn "could not fully clear the chart cache under $SYSTEM_APPS -- check ownership (a
+    run done with sudo leaves it root-owned). The next build may render a stale chart."
+  fi
+else
+  warn "no $SYSTEM_APPS -- nothing to clear"
 fi
 
 # ── Packages ──────────────────────────────────────────────
