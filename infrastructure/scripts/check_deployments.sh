@@ -245,4 +245,57 @@ else
   fail=1
 fi
 
+# The apt-source ordering invariant in playbook.yml -- a cross-file-shaped problem living
+# inside one file: an ordering relationship between two tasks hundreds of lines apart,
+# where neither looks wrong on its own.
+#
+# `gpg --dearmor` writes the Kubernetes keyring 0600 and apt runs gpgv as the unprivileged
+# `_apt`, so until the mode task has run the repository verifies as unsigned. An apt
+# refresh validates EVERY configured source, so any `update_cache: true` that runs before
+# that task takes the whole play down -- and re-running cannot fix it, because the repair
+# is downstream of the thing that fails. Three separate attempts at this each moved the
+# error earlier in the play rather than removing it, which is what makes it worth a check
+# rather than a comment.
+echo "==> infrastructure/k8s-ansible/playbook.yml"
+if apt_order_errors=$(python3 - 2>&1 <<'APTPY'
+import pathlib, re, sys
+
+lines = pathlib.Path("infrastructure/k8s-ansible/playbook.yml").read_text().splitlines()
+REPAIR = "Make the Kubernetes apt key readable by _apt"
+
+repair = [i for i, l in enumerate(lines, 1)
+          if re.match(r"\s*- name:\s*" + re.escape(REPAIR) + r"\s*$", l)]
+refresh = [i for i, l in enumerate(lines, 1)
+           if re.match(r"\s*update_cache:\s*true\s*$", l)]
+
+errors = []
+if not repair:
+    errors.append("no task named %r -- the keyring is never made readable by _apt, so"
+                  " every apt refresh rejects the Kubernetes repo as unsigned" % REPAIR)
+elif len(repair) > 1:
+    errors.append("%r appears %d times (lines %s); this check assumes one"
+                  % (REPAIR, len(repair), repair))
+else:
+    early = [n for n in refresh if n < repair[0]]
+    if early:
+        errors.append(
+            "`update_cache: true` at line(s) %s runs before %r at line %d. An apt refresh"
+            " validates every configured repository, so on any machine that already has"
+            " kubernetes.list this fails before the play can repair the keyring -- and"
+            " re-running cannot help. Move the apt-source block ahead of the first"
+            " refresh, or drop update_cache from the earlier task."
+            % (early, REPAIR, repair[0]))
+
+print("\n".join(errors))
+sys.exit(1 if errors else 0)
+APTPY
+); then
+  echo "    ok"
+else
+  while IFS= read -r line; do
+    echo "    FAIL: $line"
+  done <<<"$apt_order_errors"
+  fail=1
+fi
+
 exit "$fail"
