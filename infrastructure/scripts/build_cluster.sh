@@ -172,23 +172,24 @@ else
   info "not configured yet -- the play will add it"
 fi
 
-# Below the apt-source repair above, not before it. `apt-get install` does not refresh
-# the cache by default, so this would not fire the ordering problem today -- but that is a
-# fine distinction to leave load-bearing three lines above the block whose whole purpose is
-# to enforce the ordering, and this branch has twice found that an ordering assumption
-# stated only in a comment is worth restating as position.
-#
-# It is also now the only apt call ahead of `install_ansible.sh`: the `command -v curl`
-# fallback went with the crictl block, and that one did `update && install`. On a machine
-# with empty apt lists this install would fail with no preceding refresh, so it refreshes
-# first -- safe here because the repair above has already dealt with a broken
-# kubernetes.list.
 # Checked here rather than discovered at the end. The end-state block reads the
 # ApplicationSet name and the ingress pin out of YAML with PyYAML, and that runs *after*
 # the play has succeeded -- so on a box without it a working cluster ends this script with
 # a ModuleNotFoundError under `set -e`. check_deployments.sh would normally surface it
 # earlier, but on a fresh machine that is skipped for want of helm, so this is the first
 # use. CI installs PyYAML explicitly, which is a good sign it should not be assumed here.
+#
+# Placed below the apt-source repair, not above it. `apt-get install` does not refresh the
+# cache by default, so this would not fire the ordering problem today -- but that is a fine
+# distinction to leave load-bearing three lines above the block whose whole purpose is to
+# enforce the ordering, and this branch has twice found that an ordering assumption stated
+# only in a comment is worth restating as position.
+#
+# It is also the only apt call ahead of `install_ansible.sh` now: the `command -v curl`
+# fallback went with the crictl block, and that one did `update && install`. On a machine
+# with empty apt lists a bare install would fail with no preceding refresh, so it refreshes
+# first -- safe here because the repair above has already dealt with a broken
+# kubernetes.list.
 if python3 -c 'import yaml' 2>/dev/null; then
   info "PyYAML present"
 else
@@ -196,7 +197,6 @@ else
   sudo apt-get update -qq
   sudo apt-get install -y python3-yaml
 fi
-
 
 # ── Ansible ───────────────────────────────────────────────
 step "Ansible"

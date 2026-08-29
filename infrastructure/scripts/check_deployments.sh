@@ -276,10 +276,20 @@ repair = [i for i, l in enumerate(lines, 1)
 # something other than the apt module (`command: apt-get update`, `apt_repository` with
 # update_cache), and anything in a file this does not read, since the play is a single
 # file with no includes. Each would need a different check; none is reachable by grep.
+#
+# Comment lines are skipped, and that is not cosmetic. The colon branch is anchored
+# (`match` ... `$`), so prose cannot trip it; the inline branch has to be an unanchored
+# `search` to find `update_cache=yes` mid-line, which means a comment *mentioning* the
+# inline spelling matches. The apt-sources block in that play is several paragraphs of
+# prose about update_cache, so the failure a maintainer hits is: document the inline form
+# above the repair task -- exactly what the comment here suggests someone might do -- and
+# CI goes red asserting an ordering bug that does not exist. A check whose message is a
+# confident description of a specific bug has to be right about it.
 BOOL = r"(true|yes|on)"
 refresh = [i for i, l in enumerate(lines, 1)
-           if re.match(r"\s*update_cache:\s*" + BOOL + r"\s*$", l, re.I)
-           or re.search(r"\bupdate_cache\s*=\s*" + BOOL + r"\b", l, re.I)]
+           if not l.lstrip().startswith("#")
+           and (re.match(r"\s*update_cache:\s*" + BOOL + r"\s*$", l, re.I)
+                or re.search(r"\bupdate_cache\s*=\s*" + BOOL + r"\b", l, re.I))]
 
 errors = []
 if not repair:
