@@ -16,10 +16,28 @@
     helm_sha256:
       amd64: 61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
       arm64: b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a5fd3b85a7
+    # Same treatment, same reasoning: a pinned version and the SHA256 of the artefact
+    # itself, per version and per architecture. crictl is not packaged on Ubuntu, and
+    # `kubeadm reset` drives the CRI through it -- without it the reset reports success
+    # while leaving every container running, so it is a prerequisite for tearing this
+    # cluster down, not just for building it. It used to be installed by a bash
+    # reimplementation of the Helm block below (a second arch map, a second digest table)
+    # with a third copy of the pin in README.md; this is the one place it is stated.
+    crictl_version: v1.31.1
+    crictl_sha256:
+      amd64: 0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231
+      arm64: cd70f9b2f75c9619f40450d4b6e2c74aaab619917da517eff6787b442f8b0e56
     # Everything ArgoCD needs in order to run, and nothing else -- the membership rule is
     # in system-apps/README.md. These are deployed by this play; deployment/ is ArgoCD's
     # half and this play never applies anything from it.
-    system_apps_dir: "{{ repo_path }}/infrastructure/k8s-ansible/system-apps"
+    # playbook_dir, not repo_path. system-apps/ sits beside this file, so the play can
+    # locate it without being told where the checkout is -- and `repo_path` was a guess:
+    # group_vars defaulted it to /home/<user>/dev/ai-platform, so from a second clone, a
+    # git worktree or /opt the play read its charts out of the *guessed* directory and
+    # deployed whatever was on disk there rather than the tree it was launched from. No
+    # task compared the two, so that was silent. Passing `-e repo_path=` fixed it only for
+    # callers who remembered to; deriving it removes the question.
+    system_apps_dir: "{{ playbook_dir }}/system-apps"
     cilium_chart_dir: "{{ system_apps_dir }}/cilium"
     # Ours to name -- nothing outside this play refers to it. ArgoCD finds it by label and
     # pairs it to a repository by URL, not by name.
@@ -258,6 +276,12 @@
           overlay
           br_netfilter
 
+    # NOTE: infrastructure/scripts/destroy_cluster.sh undoes this section by hand -- the
+    # sysctl file, the modules-load file, the systemd drop-ins below, the fstab swap edit
+    # and the two binaries installed to /usr/local/bin are all restated as literals there,
+    # and nothing keeps the two lists in step. Add a file here and the teardown silently
+    # stops being complete while still reporting Done. If you touch what this play writes
+    # outside /etc/kubernetes, update that script's matching step.
     - name: Set sysctl params
       sysctl:
         name: "{{ item.key }}"
@@ -308,12 +332,49 @@
         state: directory
         mode: '0755'
 
+    # Guarded on the keyring holding a key, NOT on the file existing, and written through
+    # a temporary file. `creates:` cannot carry this, because `gpg --dearmor -o` creates
+    # its output before it fails: a 403, a proxy interstitial or a truncated download
+    # leaves a zero-byte keyring behind and fails the run. Every later run then skips this
+    # task -- the file is there -- chmods the empty keyring 0644, reports ok, and dies at
+    # the first `update_cache` with NO_PUBKEY. That is the same wedge the ordering above
+    # exists to prevent, reached from the other side, and it survives re-running: the only
+    # way out is deleting the keyring by hand.
+    #
+    # The existence check has to be a *content* check for the same reason. `gpg
+    # --list-keys` exits 0 on a zero-byte keyring and on an absent one -- it only fails on
+    # a file that is malformed rather than empty -- so the exit status cannot tell the
+    # wedge state from a healthy one. Match a `pub:` record in --with-colons output, which
+    # is gpg's machine-readable format and distinguishes all four cases (valid, empty,
+    # malformed, absent).
+    #
+    # mktemp + mv makes the install atomic, so a failed download cannot leave a partial
+    # keyring for the next run to trip over; the temp file is created alongside the target
+    # so the mv is a rename within one filesystem. The mode is set here as well as by the
+    # task below -- here so the file is never briefly readable-only-by-root at the moment
+    # apt might look, there so a keyring from an older revision of this play is repaired.
     - name: Add Kubernetes apt key
       shell: |
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
-        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        set -o pipefail
+        keyring=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        if gpg --no-default-keyring --keyring "$keyring" --list-keys --with-colons 2>/dev/null \
+             | grep -q '^pub:'; then
+          echo UNCHANGED
+          exit 0
+        fi
+        tmp=$(mktemp -p /etc/apt/keyrings kubernetes-apt-keyring.gpg.XXXXXX)
+        trap 'rm -f "$tmp"' EXIT
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key \
+          | gpg --dearmor --yes -o "$tmp"
+        gpg --no-default-keyring --keyring "$tmp" --list-keys --with-colons | grep -q '^pub:'
+        chmod 0644 "$tmp"
+        mv "$tmp" "$keyring"
+        trap - EXIT
+        echo INSTALLED
       args:
-        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        executable: /bin/bash
+      register: k8s_apt_key
+      changed_when: "'INSTALLED' in k8s_apt_key.stdout"
 
     # `gpg --dearmor -o` writes with gpg's own restrictive umask, so the keyring lands
     # 0600 root:root. The `file:` task above sets 0755 on the *directory*; nothing set a
@@ -339,9 +400,21 @@
         path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
         mode: '0644'
 
+    # mode, for the same reason the keyring above needs one: `copy:` with no mode inherits
+    # root's umask and writes 0600, while every other file in sources.list.d is 0644. apt's
+    # own operations run as root and are unaffected, so this is milder than the keyring --
+    # but any unprivileged apt query silently loses the repository:
+    #
+    #   $ apt-cache rdepends --installed containerd
+    #   W: Unable to read /etc/apt/sources.list.d/kubernetes.list - open (13: Permission denied)
+    #
+    # which is exactly the query destroy_cluster.sh uses to decide whether anything depends
+    # on containerd before purging it. A repo that vanishes for non-root readers is a bad
+    # input to that decision.
     - name: Add Kubernetes apt repository
       copy:
         dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
         content: |
           deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
 
@@ -681,6 +754,62 @@
             state: absent
           when: helm_tmp.path is defined
 
+    # ── crictl ────────────────────────────────────────────
+    # Same shape as Helm above and deliberately beside it, sharing release_arch and the
+    # pinned-checksum assert rather than restating them. Needed by `kubeadm reset`, by
+    # recover_apiserver.sh and by destroy_cluster.sh; the teardown checks for it in
+    # preflight and refuses rather than performing a reset that silently does nothing.
+    #
+    # Version-matched, not merely present: `crictl --version` is compared exactly, because
+    # a substring test accepts v1.31.10 for a v1.31.1 pin and would leave the wrong binary
+    # in place while reporting the pinned one.
+    - name: Check the installed crictl version
+      command: crictl --version
+      register: crictl_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install the pinned crictl release
+      when: crictl_installed.stdout | default('') | trim != 'crictl version ' ~ crictl_version
+      block:
+        - name: Create a scratch directory for the crictl download
+          tempfile:
+            state: directory
+            suffix: crictl
+          register: crictl_tmp
+
+        - name: Download the pinned crictl release
+          get_url:
+            url: >-
+              https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-{{ release_arch }}.tar.gz
+            dest: "{{ crictl_tmp.path }}/crictl.tar.gz"
+            checksum: sha256:{{ crictl_sha256[release_arch] }}
+            mode: '0644'
+
+        # The tarball holds the binary alone, but unpack to the scratch directory anyway
+        # so nothing lands in /usr/local/bin unless the checksum above passed.
+        - name: Unpack crictl
+          unarchive:
+            src: "{{ crictl_tmp.path }}/crictl.tar.gz"
+            dest: "{{ crictl_tmp.path }}"
+            remote_src: true
+
+        - name: Install the crictl binary
+          copy:
+            src: "{{ crictl_tmp.path }}/crictl"
+            dest: /usr/local/bin/crictl
+            remote_src: true
+            owner: root
+            group: root
+            mode: '0755'
+
+      always:
+        - name: Remove the crictl scratch directory
+          file:
+            path: "{{ crictl_tmp.path }}"
+            state: absent
+          when: crictl_tmp.path is defined
+
     # ── Cilium CNI ────────────────────────────────────────
     # The chart is an umbrella over the upstream cilium chart, and charts/ and Chart.lock
     # are gitignored -- they are a resolved cache, not source -- so the dependency has to
@@ -710,9 +839,9 @@
       become: false
       register: cilium_deps_cached
 
-    # become: false, like every task below it: repo_path is inside the operator's home,
-    # and a root-owned charts/ there would break the operator's own `helm dependency
-    # update` and infrastructure/scripts/check_deployments.sh afterwards.
+    # become: false, like every task below it: the chart lives inside the checkout, which
+    # is normally in the operator's home, and a root-owned charts/ there would break the
+    # operator's own `helm dependency update` and check_deployments.sh afterwards.
     - name: Resolve the Cilium chart's dependencies
       command: helm dependency update {{ cilium_chart_dir }}
       become: false
@@ -795,6 +924,19 @@
         kubectl -n kube-system rollout status ds/cilium --timeout=10m
         kubectl -n kube-system rollout status deploy/cilium-operator --timeout=5m
         kubectl -n kube-system rollout status ds/cilium-envoy --timeout=5m
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      changed_when: false
+
+    # The rollouts above say the CNI's own workloads are up; this says the kubelet agrees.
+    # Node readiness is gated on a CNI reporting itself ready, so it is a different claim
+    # from "the DaemonSet rolled out" -- and it is the one every task below implicitly
+    # assumes, since nothing schedules on a NotReady node. It was the only end-state check
+    # in build_cluster.sh's post-verify that this play did not already make; the rest of
+    # that block duplicated gates from here, so it now defers to these instead.
+    - name: Wait for the node to be Ready
+      command: kubectl wait --for=condition=Ready node --all --timeout=5m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
