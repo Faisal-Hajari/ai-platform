@@ -140,19 +140,6 @@ head -1 "$VAULT_FILE" | grep -q '^\$ANSIBLE_VAULT' \
     encrypt it with \`ansible-vault encrypt $VAULT_FILE\` before going further."
 info "vault present and encrypted (its *contents* are checked by the play's pre_tasks)"
 
-# Checked here rather than discovered at the end. The end-state block reads the
-# ApplicationSet name and the ingress pin out of YAML with PyYAML, and that runs *after*
-# the play has succeeded -- so on a box without it a working cluster ends this script with
-# a ModuleNotFoundError under `set -e`. check_deployments.sh would normally surface it
-# earlier, but on a fresh machine that is skipped for want of helm, so this is the first
-# use. CI installs PyYAML explicitly, which is a good sign it should not be assumed here.
-if python3 -c 'import yaml' 2>/dev/null; then
-  info "PyYAML present"
-else
-  info "installing python3-yaml (the end-state check reads the charts with it)"
-  sudo apt-get install -y python3-yaml
-fi
-
 # ── Repair a half-configured apt source ───────────────────
 # This has to happen before anything runs `apt update`, and two steps below can:
 # install_ansible.sh opens with one, and so does the curl fallback. An apt refresh
@@ -184,6 +171,32 @@ if [ -e "$K8S_APT_LIST" ] || [ -e "$K8S_KEYRING" ]; then
 else
   info "not configured yet -- the play will add it"
 fi
+
+# Below the apt-source repair above, not before it. `apt-get install` does not refresh
+# the cache by default, so this would not fire the ordering problem today -- but that is a
+# fine distinction to leave load-bearing three lines above the block whose whole purpose is
+# to enforce the ordering, and this branch has twice found that an ordering assumption
+# stated only in a comment is worth restating as position.
+#
+# It is also now the only apt call ahead of `install_ansible.sh`: the `command -v curl`
+# fallback went with the crictl block, and that one did `update && install`. On a machine
+# with empty apt lists this install would fail with no preceding refresh, so it refreshes
+# first -- safe here because the repair above has already dealt with a broken
+# kubernetes.list.
+# Checked here rather than discovered at the end. The end-state block reads the
+# ApplicationSet name and the ingress pin out of YAML with PyYAML, and that runs *after*
+# the play has succeeded -- so on a box without it a working cluster ends this script with
+# a ModuleNotFoundError under `set -e`. check_deployments.sh would normally surface it
+# earlier, but on a fresh machine that is skipped for want of helm, so this is the first
+# use. CI installs PyYAML explicitly, which is a good sign it should not be assumed here.
+if python3 -c 'import yaml' 2>/dev/null; then
+  info "PyYAML present"
+else
+  info "installing python3-yaml (the end-state check reads the charts with it)"
+  sudo apt-get update -qq
+  sudo apt-get install -y python3-yaml
+fi
+
 
 # ── Ansible ───────────────────────────────────────────────
 step "Ansible"

@@ -367,16 +367,18 @@
     # `creates:` produced, but within the run it converts a clean failure here into
     # `E: The repository ... is not signed` at the first update_cache, which is the exact
     # error the ordering of this block exists to eliminate. The `if` guard is exempt from
-    # -e, so the UNCHANGED path is unaffected, and the trap clears the temp file. The mode is set here as well as by the
-    # task below -- here so the file is never briefly readable-only-by-root at the moment
-    # apt might look, there so a keyring from an older revision of this play is repaired.
+    # -e, so the UNCHANGED path is unaffected, and the trap clears the temp file.
+    #
+    # The mode is set here as well as by the task below -- here so the file is never
+    # briefly readable-only-by-root at the moment apt might look, there so a keyring left
+    # by an older revision of this play is repaired.
     - name: Add Kubernetes apt key
       shell: |
         set -euo pipefail
         keyring=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
         if [ -s "$keyring" ] \
-           && gpg --no-default-keyring --keyring "$keyring" --list-keys --with-colons 2>/dev/null \
-             | grep -q '^pub:'; then
+           && gpg --no-default-keyring --keyring "$keyring" \
+                  --list-keys --with-colons 2>/dev/null | grep -q '^pub:'; then
           echo UNCHANGED
           exit 0
         fi
@@ -636,7 +638,6 @@
           the vars at the top of this play.
         success_msg: "pinning the {{ release_arch }} artefact"
 
-
     # ── crictl ────────────────────────────────────────────
     # Ahead of `kubeadm init`, deliberately. crictl is what `kubeadm reset` drives the CRI
     # through, so it is a prerequisite for tearing this cluster down -- and
@@ -645,10 +646,12 @@
     # interrupted run) left a machine that had a cluster and could not tear it down with
     # the tooling this repo provides. Nothing here needs a running cluster, so there is no
     # reason to be downstream of one.
-    # Same shape as Helm above and deliberately beside it, sharing release_arch and the
-    # pinned-checksum assert rather than restating them. Needed by `kubeadm reset`, by
-    # recover_apiserver.sh and by destroy_cluster.sh; the teardown checks for it in
-    # preflight and refuses rather than performing a reset that silently does nothing.
+    #
+    # Same shape as the Helm block further down, and sharing the architecture resolution
+    # above rather than restating it -- that block reads release_arch too, which is why it
+    # moved up here with crictl rather than staying with Helm. Also needed by
+    # recover_apiserver.sh; the teardown checks for it in preflight and refuses rather
+    # than performing a reset that silently does nothing.
     #
     # Version-matched, not merely present: `crictl --version` is compared exactly, because
     # a substring test accepts v1.31.10 for a v1.31.1 pin and would leave the wrong binary
@@ -793,8 +796,9 @@
     # Helm, against system-apps/cilium/. The Cilium CLI is no longer installed; its one
     # remaining advantage was auto-detecting k8sServiceHost, and values.yaml pins that.
     #
-    # A missing key leaves this undefined rather than raising, so the assert below can
-    # say which architecture had no pinned checksum instead of failing inside Jinja.
+    # release_arch and its pinned-checksum assert are resolved further up, above the crictl
+    # block, because crictl has to be installed before `kubeadm init` and reads the same
+    # fact. This section consumes it; it no longer declares it.
     - name: Check the installed Helm version
       command: helm version --short
       register: helm_installed

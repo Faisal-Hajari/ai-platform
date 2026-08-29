@@ -265,12 +265,21 @@ REPAIR = "Make the Kubernetes apt key readable by _apt"
 
 repair = [i for i, l in enumerate(lines, 1)
           if re.match(r"\s*- name:\s*" + re.escape(REPAIR) + r"\s*$", l)]
-# YAML's booleans are not just `true`: Ansible accepts yes/on/True/YES equally, so a
-# future task written `update_cache: yes` ahead of the repair would sail past a check
-# that only knew the lowercase spelling -- reintroducing precisely the bug this exists
-# to catch, while the check stayed green.
+# Two spellings, because a check that only knows one is a check that a future edit walks
+# past. YAML's booleans are not just `true` -- Ansible accepts yes/on/True/YES equally --
+# and the module can also be written inline as `apt: name=curl update_cache=yes`, which is
+# exactly the terser form someone reaches for when adding a quick task. Nothing in this
+# repo uses the inline spelling today; it is here so that "today" is not load-bearing.
+#
+# What this still cannot see, stated so the check is honest about its own reach: a value
+# supplied by a variable (`update_cache: "{{ refresh }}"`), a refresh performed by
+# something other than the apt module (`command: apt-get update`, `apt_repository` with
+# update_cache), and anything in a file this does not read, since the play is a single
+# file with no includes. Each would need a different check; none is reachable by grep.
+BOOL = r"(true|yes|on)"
 refresh = [i for i, l in enumerate(lines, 1)
-           if re.match(r"\s*update_cache:\s*(true|yes|on)\s*$", l, re.I)]
+           if re.match(r"\s*update_cache:\s*" + BOOL + r"\s*$", l, re.I)
+           or re.search(r"\bupdate_cache\s*=\s*" + BOOL + r"\b", l, re.I)]
 
 errors = []
 if not repair:
@@ -283,7 +292,7 @@ else:
     early = [n for n in refresh if n < repair[0]]
     if early:
         errors.append(
-            "`update_cache: true` at line(s) %s runs before %r at line %d. An apt refresh"
+            "an apt cache refresh at line(s) %s runs before %r at line %d. An apt refresh"
             " validates every configured repository, so on any machine that already has"
             " kubernetes.list this fails before the play can repair the keyring -- and"
             " re-running cannot help. Move the apt-source block ahead of the first"
