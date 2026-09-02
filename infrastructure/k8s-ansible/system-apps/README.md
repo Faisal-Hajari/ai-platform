@@ -40,7 +40,8 @@ system-apps/
     Chart.yaml        umbrella over the upstream cilium chart, version pinned
     values.yaml       the whole configuration, including three host-specific values
     config/
-      ip-pool.yaml    CiliumLoadBalancerIPPool
+      ip-pool.yaml    two CiliumLoadBalancerIPPools: the ingress reservation, and
+                      the general range
       l2-policy.yaml  CiliumL2AnnouncementPolicy
   argocd/
     Chart.yaml        umbrella over the upstream argo-cd chart, version pinned
@@ -58,17 +59,22 @@ mechanism; the double render was the cause.
 
 **`config/` is part of the Cilium unit**, applied by the same playbook step, ordered
 after the CRDs the operator registers. The ingress address pinned in `values.yaml` has to
-sit inside the pool declared in `config/ip-pool.yaml`; as two separately-synced
+be served by a pool declared in `config/ip-pool.yaml`; as two separately-synced
 Applications with no ordering between them, that pair could disagree transiently even
 when both files were individually correct.
 
-The pool has a second constraint that is not in this repo at all: `config/l2-policy.yaml`
+That address gets a pool of its own, scoped by `serviceSelector` to the `cilium-ingress`
+Service, and the general pool starts above it. Sharing one pool made the pin an address
+LB-IPAM could also hand to an unpinned Service — and it does not take one back, so the
+next `cilium-ingress` would come up unsatisfied and stay that way (#69).
+
+The pools have a second constraint that is not in this repo at all: `config/l2-policy.yaml`
 announces those addresses over ARP on one named interface, and they only reach the LAN
-while the pool sits on the subnet that interface is attached to. That subnet is a DHCP
+while they sit on the subnet that interface is attached to. That subnet is a DHCP
 lease on the node and nothing in git states it, so the two halves are checked in two
 places — `../../scripts/check_deployments.sh` asserts that a policy exists and announces
 LoadBalancer addresses, and `../playbook.yml` resolves the interfaces the policy matches
-on the host and refuses to build anything if the pool is off their subnets. Both matter
+on the host and refuses to build anything if a pool block is off their subnets. Both matter
 because the cluster reports none of it: LB-IPAM allocates, the Service gets an
 `EXTERNAL-IP`, and the address is unreachable.
 
@@ -95,10 +101,11 @@ The order the play uses is load-bearing and worth knowing before editing it:
 3. Poll for the two CRDs, then wait for `Established`. `cilium-operator` registers them at
    runtime; the chart does not ship them under `crds/`.
 4. `kubectl apply -f config/`.
-5. Wait for `cilium-ingress` to be served an address. A pin outside the pool leaves
-   LB-IPAM with `IPAMRequestSatisfied=False`, no address on the Service, and every Ingress
-   in the cluster dead — with no reconciler behind the play, a run that went green here
-   would be the last thing to notice.
+5. Wait for `cilium-ingress` to be served an address — the pinned one, not merely some
+   address. A pin no pool will serve — whether outside every pool, or already given away by
+   one — leaves LB-IPAM with `IPAMRequestSatisfied=False`, no address on the Service, and
+   every Ingress in the cluster dead — with no reconciler behind the play, a run that went
+   green here would be the last thing to notice.
 
 **Both entries are the same shape**: a chart with a pinned version and a `values.yaml`.
 ArgoCD used to install from a pinned `raw.githubusercontent.com` URL (`v3.3.11`) held as a
@@ -130,8 +137,10 @@ change the set of things that mutate Cilium is approximately empty — but it is
 decision, not a side effect.
 
 **No prune under `config/`.** The playbook applies those manifests with `kubectl apply
--f`, which has no prune: deleting a pool from git leaves it in the cluster. Acceptable
-for two small manifests; removing one means also deleting it by hand.
+-f`, which has no prune: deleting a pool from git leaves it in the cluster — and a stale
+pool still hands out addresses, which for an overlapping range is how one gets marked
+`Conflicting`. Acceptable for three small objects in two files; removing one, or merging
+the two pools back into one, means also deleting it by hand.
 
 **Re-running the playbook is the only update path**, so everything here has to be
 idempotently re-runnable. `helm upgrade --install` is its own guard and `kubectl apply`

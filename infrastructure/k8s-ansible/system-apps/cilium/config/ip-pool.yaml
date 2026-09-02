@@ -1,36 +1,111 @@
+# Two pools, and the split between them is the point.
+#
+# The shared ingress entrypoint is pinned to one address in ../values.yaml; everything
+# else that asks for a LoadBalancer takes whatever LB-IPAM hands out. While both came out
+# of one pool, the pinned address was also an address LB-IPAM could give away -- and it
+# does not take one back. An allocation is final: LB-IPAM will not evict a holder to
+# satisfy a request, so a pin whose address is already held gets IPAMRequestSatisfied=False
+# on kube-system/cilium-ingress, the Service never gets an address, and every Ingress in
+# the cluster is dead until someone deletes the holder by hand (#69).
+#
+# That was not a distant hypothetical: .200 was both the pin and the lowest address the
+# only pool offered, so the first unpinned Service to appear while cilium-ingress was
+# absent -- a helm uninstall, an ingressController toggle, the nuke-and-rebuild path in
+# ../../README.md -- took it. #16 was the same collision from the other side, an untracked
+# default/test-nginx sitting on the address the pool wanted to start at.
+#
+# Splitting the pinned address into its own serviceSelector-scoped pool states the
+# reservation rather than leaving it to allocation order. LB-IPAM skips a pool whose
+# serviceSelector does not match the Service it is allocating for, on the specific-IP path
+# and the give-me-anything path alike (operator/pkg/lbipam/lbipam.go), so nothing but
+# cilium-ingress can be given .200 whatever order things arrive in.
+#
+# Ordering below is load-bearing on a cluster that already has the single .200-.215 pool:
+# kubectl applies the documents of a file in order, so shrinking the general pool first
+# means the two never overlap. The other order puts ingress-pool on top of a range
+# local-pool still claims, and Cilium settles overlapping pools by marking the newer one
+# Conflicting and disabling it until a later settle pass -- converging, but through a
+# window where the pool holding the pin is switched off. Either way cilium-ingress is
+# briefly without an address while .200 moves between pools; the play's ingress wait
+# covers that.
+#
+# For the same reason the general pool keeps the name it already has in the cluster: the
+# play applies this directory with `kubectl apply -f`, which has no prune, so a pool
+# renamed here would leave the old .200-.215 one behind -- still live, still handing out
+# the pinned address, and invisible to a check that reads git.
+#
+# Both pools carry one more constraint that is not in this repo at all: the LAN they are
+# on. config/l2-policy.yaml announces these addresses over ARP on one named interface, and
+# they only reach anything while they sit on that interface's subnet -- 192.168.100.0/24,
+# which is a DHCP lease on the node and is written down nowhere here. No check over these
+# files can see that, so infrastructure/k8s-ansible/playbook.yml asserts it against the
+# host before it builds anything (#39). Moving either range to another subnet means moving
+# the interface with it, and there is no cluster-side warning if you do not: LB-IPAM
+# allocates happily out of a range nothing announces.
 apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: local-pool
 spec:
   blocks:
-    # Written as start/stop, not a CIDR, because .200-.215 is not a CIDR: it spans
-    # the 192.168.100.192/28 boundary. An earlier revision did write it as
-    # "192.168.100.200/28", which LB-IPAM normalized to 192.168.100.192/28 -- so the
-    # pool quietly handed out .192-.199 as well, and .200 sat inside it only by that
-    # accident (#8).
+    # The general pool: no serviceSelector, so any LoadBalancer Service can be allocated
+    # out of it -- which is exactly why it starts above the pinned address rather than at
+    # it. Keep it clear of anything ingress-pool below reserves;
+    # infrastructure/scripts/check_deployments.sh fails on any two pool blocks that
+    # overlap, at the pinned address or anywhere else. Cilium's own answer to an overlap is
+    # to mark one of the two pools Conflicting and disable every range it has, so a widened
+    # reservation does not merely blur the split -- it can switch the reservation off.
     #
-    # The floor stayed at .192 for a while longer because default/test-nginx held
-    # .192 and moving the floor would have evicted it onto the .200 that
-    # ../values.yaml pins for the ingress. That service was an untracked
-    # hand-made test fixture (#16) and has since been deleted, so the floor is free
-    # to be what it was always meant to be.
-    #
-    # .200 is the address ../values.yaml pins for kube-system/cilium-ingress via
-    # lbipam.cilium.io/ips -- keep the two in step.
-    # infrastructure/scripts/check_deployments.sh asserts that containment, including
-    # the CIDR normalization above, and .github/workflows/check-deployments.yml runs it
-    # on every change to this chart. That run going red is the warning that arrives
-    # before the cluster's, which is IPAMRequestSatisfied=False and every Ingress dead --
-    # a signal, not a merge gate, so do not sail past it.
-    #
-    # The other constraint on this range is the LAN it is on. config/l2-policy.yaml
-    # announces these addresses over ARP on one named interface, and they only reach
-    # anything while they sit on that interface's subnet -- 192.168.100.0/24, which is a
-    # DHCP lease on the node and is written down nowhere in this repo. No check here can
-    # see that, so infrastructure/k8s-ansible/playbook.yml asserts it against the host
-    # before it builds anything (#39). Moving this range to another subnet means moving
-    # the interface with it, and there is no cluster-side warning if you do not: LB-IPAM
-    # allocates happily out of a range nothing announces.
-    - start: "192.168.100.200"
+    # Written as start/stop, not a CIDR, because .201-.215 is not one. An earlier revision
+    # wrote the range as "192.168.100.200/28", which LB-IPAM normalized to
+    # 192.168.100.192/28 -- so the pool quietly handed out .192-.199 as well, and .200 sat
+    # inside it only by that accident (#8). That normalization is still the reason
+    # check_deployments.sh compares against the network a CIDR really offers rather than
+    # against the range someone meant to write.
+    - start: "192.168.100.201"
       stop: "192.168.100.215"
+---
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: ingress-pool
+spec:
+  # The reservation. LB-IPAM matches this against the Service's own labels plus two it
+  # synthesizes -- io.kubernetes.service.name and io.kubernetes.service.namespace
+  # (operator/pkg/lbipam/service_store.go) -- so selecting on the name names the one
+  # Service this address exists for, without depending on a label the upstream chart is
+  # free to rename.
+  #
+  # A selector is only a reservation while it names this Service and no other, so
+  # check_deployments.sh matches it against every Service in the render and fails one that
+  # catches more than the ingress: app.kubernetes.io/part-of: cilium, the other label this
+  # Service carries, is on all three and would reserve the address for a set rather than
+  # for the shared entrypoint.
+  #
+  # It also fails a selector built only of NotIn and DoesNotExist terms, which is the one
+  # shape the render cannot judge: `DoesNotExist: k8s-app` matches only this Service among
+  # the three rendered -- the other two carry that label -- and matches nearly every
+  # Service in the cluster. So name something positively here; excluding what you know
+  # about bounds nothing.
+  #
+  # Name and namespace together would be narrower still -- this matches a Service named
+  # cilium-ingress in any namespace, and there is one. Name alone because check_deployments.sh
+  # evaluates this selector against `helm template` output and renders every chart without
+  # --namespace, so the Service arrives stamped `default` rather than the kube-system the
+  # play installs into. A selector this repo's own check cannot evaluate is a reservation
+  # nothing verifies, which is the situation this pool exists to end, so the check refuses a
+  # namespace selector rather than guessing at it. Giving that render loop a per-chart
+  # namespace is what would let this say both.
+  serviceSelector:
+    matchLabels:
+      io.kubernetes.service.name: cilium-ingress
+  blocks:
+    # One address, and it is the one ../values.yaml pins via lbipam.cilium.io/ips -- keep
+    # the two in step. infrastructure/scripts/check_deployments.sh asserts both halves:
+    # that the pin is inside a pool that can serve the ingress, and that no pool serving
+    # anything else covers it. .github/workflows/check-deployments.yml runs it on every
+    # change to this chart. That run going red is the warning that arrives before the
+    # cluster's, which is IPAMRequestSatisfied=False and every Ingress dead -- a signal,
+    # not a merge gate, so do not sail past it.
+    - start: "192.168.100.200"
+      stop: "192.168.100.200"
