@@ -1,0 +1,20 @@
+# Umbrella over the upstream argo-cd chart, exactly as cilium/Chart.yaml is over cilium's.
+# This is the only place ArgoCD's version is written down; it used to be a literal inside
+# a raw.githubusercontent.com URL in ../../playbook.yml, where nothing rendered it and
+# check_deployments.sh could not see it.
+#
+# The chart version is the pin, and the ArgoCD version rides along as its appVersion --
+# they are not the same number and cannot be set independently. argo-cd 10.6.4 ships
+# ArgoCD v3.5.2. Before bumping, check the appVersion you are actually moving to:
+#
+#   helm search repo argo/argo-cd --versions | head
+#
+# and re-read the rollout wait in ../../playbook.yml: it names four Deployments, and a
+# chart that renamed or dropped one would fail there rather than at install.
+apiVersion: v2
+name: argocd
+version: 1.0.0
+dependencies:
+  - name: argo-cd
+    version: 10.6.4
+    repository: https://argoproj.github.io/argo-helm
