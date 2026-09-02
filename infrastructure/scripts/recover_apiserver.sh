@@ -33,7 +33,19 @@ command -v crictl >/dev/null || { echo "crictl not found -- see README.md"; exit
 
 # Every container object by this name, running or not: the live one and the orphan that
 # holds the reservation.
-IDS=$(crictl ps -a --name "^${NAME}$" -q)
+#
+# Guarded (#58): the bare assignment adopted crictl's status under `set -e`, so a crictl
+# that cannot reach containerd ended the script with no message. It must not become
+# `|| true` either -- an empty IDS is the "nothing to do" exit 0 four lines below, so
+# swallowing the error would turn "I could not look" into a clean bill of health on a node
+# that is wedged. crictl's stderr is deliberately left on the terminal rather than folded
+# into IDS: it prints endpoint warnings on successful runs too, and those would be counted
+# as container IDs by the `wc -l` test below.
+IDS=$(crictl ps -a --name "^${NAME}$" -q) || {
+  echo "crictl could not list containers (its error is above) -- is containerd running?" >&2
+  echo "Nothing has been removed." >&2
+  exit 1
+}
 
 if [ -z "$IDS" ]; then
   echo "No containers found named ${NAME}; nothing to do."

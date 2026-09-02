@@ -367,10 +367,23 @@ done
 # otherwise, from a `grep --version` run in an interactive shell that had a `grep` function
 # in front of the binary -- see the retraction note below the swap step.
 if installed containerd; then
+  # Guarded for the same reason as the autoremove hint below (#58) -- these are also
+  # unguarded assignments sitting after the destructive phase, and an apt-cache that
+  # cannot run would end the teardown here with no message -- but guarded the other way.
+  # A `|| true` would leave both variables empty, which reads as "nothing depends on
+  # containerd" and purges it, taking Docker's runtime with it. The hint below may fail
+  # towards silence; this may not fail towards purging, so it fails towards `die`.
+  apt_unreadable="cannot ask apt what depends on containerd, so whether purging it would
+    take another runtime's dependency with it is unknown -- and this script does not guess
+    in that direction. Nothing has been purged; the cluster and its state directories are
+    already gone. Fix apt (a held dpkg lock clears on its own, \`sudo apt-get update\`
+    names a broken source) and re-run -- this script is idempotent."
   provides=$(apt-cache showpkg containerd 2>/dev/null \
-    | sed -n '/Reverse Provides:/,$p' | awk 'NR > 1 && NF { print $1 }' | sort -u)
+    | sed -n '/Reverse Provides:/,$p' | awk 'NR > 1 && NF { print $1 }' | sort -u) \
+    || die "$apt_unreadable"
   candidates=$(sudo apt-cache rdepends --installed --important containerd 2>/dev/null \
-    | tail -n +3 | tr -d ' |' | awk 'NF' | sort -u)
+    | tail -n +3 | tr -d ' |' | awk 'NF' | sort -u) \
+    || die "$apt_unreadable"
   # A virtual provider name is not a dependant that can break, and neither is containerd
   # itself; everything else only counts if it is really installed.
   real_dependants=""
@@ -409,7 +422,33 @@ fi
 #
 # Parsing `apt-get -s` output is not a stable interface, so this is advisory only: a format
 # change makes it silently report 0. Acceptable for a hint, not for a decision.
-orphans=$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{n++} END{print n+0}')
+#
+# Guarded, because an assignment from a command substitution adopts that command's status
+# and `set -e` acts on it (#58):
+#
+#   $ bash -c 'set -euo pipefail; x=$(false); echo REACHED'; echo "rc=$?"
+#   rc=1                                    # REACHED is not printed
+#
+# Under `pipefail` any apt-get failure -- the dpkg lock held by unattended-upgrades, a
+# half-configured package from the purge above, a broken source -- ended the run on this
+# line. That is #24's shape past the point a preflight can help: the packages are already
+# gone, and containerd's state, /opt/cni, the apt source, the binaries, the host tuning,
+# the swap restore and the verification block all sit below it. An advisory hint does not
+# get to end a teardown, and this one ended it without even printing why.
+#
+# The `|| true` is inside the pipeline rather than after the substitution, which is the
+# obvious form and is wrong: awk's END block runs either way, so the failing path prints
+# its own 0 and then echo's, and `orphans` becomes two lines that `[` refuses --
+#
+#   $ orphans=$(false | awk '/^Remv /{n++} END{print n+0}' || echo 0)
+#   $ [ "$orphans" -gt 0 ]
+#   bash: [: 0
+#   0: integer expected
+#
+# -- which reports "0 orphaned" on stdout and a bash error on stderr, i.e. the hint is
+# wrong in exactly the runs it was guarded for.
+orphans=$( { apt-get -s autoremove 2>/dev/null || true; } \
+           | awk '/^Remv /{n++} END{print n+0}' )
 if [ "$orphans" -gt 0 ]; then
   info "$orphans package(s) are now orphaned -- NOT removed. Review and remove them with:"
   info "    apt-get -s autoremove   # see the list first"

@@ -276,9 +276,15 @@ verify_fail=0
 # and unquoted it is a glob, which zsh treats as a fatal "no matches found" rather than
 # passing through as bash does, so the line did not run at all under zsh.
 # destroy_cluster.sh already codifies that glob rule for its own `find`.
+#
+# `|| true` for the same reason the two checks below carry it (#58): an assignment from a
+# command substitution adopts that command's status, so an API server this kubectl cannot
+# reach ended the summary on this line -- before the ApplicationSet and ingress checks
+# that set verify_fail, and with none of the FAIL lines this block exists to print. The
+# `2>&1` means the error text lands in the variable and gets printed on the row.
 node_ready=$(kubectl get nodes --no-headers \
   -o "custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=='Ready')].status" \
-  2>&1 | tr '\n' ' ')
+  2>&1 | tr '\n' ' ' || true)
 printf '    %-22s %s\n' "node Ready" "$node_ready"
 
 appset_ready=$(kubectl -n argocd get applicationset "$appset_name" \

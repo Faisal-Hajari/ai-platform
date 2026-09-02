@@ -18,8 +18,24 @@
 
 set -euo pipefail
 
-API=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+# Guarded, and then checked for a usable value (#58). The bare assignment adopted
+# kubectl's status under `set -e`, so a kubeconfig this user cannot read ended the script
+# with no output at all. The second check matters more: a kubectl that *succeeds* with no
+# matching cluster prints nothing, and the parse below turns that into empty
+# KUBERNETES_SERVICE_HOST/PORT values which get patched straight into the DaemonSet and
+# the operator -- a recovery script deepening the outage, and looking like success while
+# it does. A server URL carrying no port is the same shape: `${API_HOST##*:}` on a string
+# with no colon returns the whole string, so PORT would be set to the hostname.
+API=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') || {
+  echo "cannot read the API server address from the kubeconfig (kubectl's error is above)." >&2
+  exit 1
+}
 API_HOST=${API#https://}; API_PORT=${API_HOST##*:}; API_HOST=${API_HOST%:*}
+if [ -z "$API_HOST" ] || [ -z "$API_PORT" ] || [ "$API_HOST" = "$API_PORT" ]; then
+  echo "the current context names no usable API server address (got '${API}')." >&2
+  echo "Check \`kubectl config current-context\` -- Cilium cannot be pointed at nothing." >&2
+  exit 1
+fi
 echo "Pointing Cilium at API server ${API_HOST}:${API_PORT}"
 
 kubectl -n kube-system patch ds cilium -p "$(cat <<YAML
