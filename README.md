@@ -5,11 +5,11 @@ System for serving AI models over k8s
 
 - `infrastructure/k8s-ansible/` — the Ansible play that bootstraps the node: containerd,
   kubeadm, chrony, Helm, `crictl`, Cilium (as the CNI *and* the ingress controller, with
-  kube-proxy skipped) and ArgoCD.
+  kube-proxy skipped), NVIDIA's GPU Operator, and ArgoCD.
 - [`infrastructure/k8s-ansible/system-apps/`](infrastructure/k8s-ansible/system-apps/README.md)
-  — what ArgoCD needs in order to run, deployed by that play: the Cilium chart and its
-  configuration, and ArgoCD's own ApplicationSet. Exactly two members, and that README
-  states the rule for what may join them.
+  — what ArgoCD cannot safely reconcile, deployed by that play: the Cilium chart and its
+  configuration, NVIDIA's GPU Operator, and ArgoCD's own ApplicationSet. Three members,
+  and that README states the two-clause rule for what may join them.
 - [`deployment/`](deployment/README.md) — the charts and manifests ArgoCD syncs. The
   ApplicationSet picks them up from here. Empty today.
 - `infrastructure/scripts/` — operational scripts, described below.
@@ -147,6 +147,43 @@ so that half needs the certs regenerated or the cluster rebuilt. The assert turn
 lease into a clear failure at the top of the run instead of a deadlock partway through,
 but a reservation avoids the situation.
 
+## GPUs
+
+Serving models on a GPU is what this platform is for, and making one *schedulable* takes
+four things. NVIDIA's GPU Operator provides three of them; the fourth is the host's.
+
+| Piece | Owner |
+|---|---|
+| The driver | **the host.** Not installed here. The play asserts `nvidia-smi -L` lists a card, at the top of the run, and refuses to go on without one |
+| `nvidia-container-toolkit` | the Operator's toolkit DaemonSet, into `/usr/local/nvidia` |
+| containerd's `nvidia` runtime handler + the `RuntimeClass` | the same DaemonSet, as a containerd drop-in |
+| The device plugin, which publishes `nvidia.com/gpu` | the Operator |
+
+The Operator is deployed by the **playbook**, from
+[`system-apps/gpu-operator/`](infrastructure/k8s-ansible/system-apps/README.md), not by
+ArgoCD. That is what its README's second membership clause exists for: the toolkit
+DaemonSet rewrites `/etc/containerd` and restarts containerd, and putting that under the
+ApplicationSet would mean `prune` and `selfHeal` on the container runtime the reconciler
+itself runs on — the same objection that moved the CNI out of `deployment/`, one layer
+down.
+
+The play does not configure containerd for GPUs anywhere. One writer, the way Cilium has
+one renderer.
+
+**The end state is asserted, not hoped for.** The play waits for the node to actually
+advertise `nvidia.com/gpu` before it moves on, up to twenty minutes on a first bootstrap
+because the toolkit, device plugin, DCGM and validator images are several GB between them.
+Every step before it can succeed while that stays false — a toolkit DaemonSet that wrote
+containerd but could not restart it, a device plugin running without the nvidia runtime and
+so seeing no devices — and each of those leaves a healthy-looking cluster where nothing can
+ever request a GPU.
+
+**No time-slicing.** One card is advertised as one GPU. Sharing it is a memory decision
+before it is a scheduling one — time-slicing hands every pod the whole card with no memory
+isolation and no queueing — so it stays off until something actually needs to share, and
+the reasoning is written down in the chart's `values.yaml` beside the setting that would
+turn it on. MIG is off for a simpler reason: this card has none.
+
 ## Scripts
 
 Each script carries a shebang and is executable, so run it directly.
@@ -159,7 +196,7 @@ Each script carries a shebang and is executable, so run it directly.
 | `recover_cilium.sh` | Unsticks a Cilium that is CrashLooping against the API server ClusterIP. Fix `k8sServiceHost` in `values.yaml` and re-run the playbook afterwards — the patches are a stopgap, and the playbook is now the only thing that renders Cilium. |
 | `recover_apiserver.sh` | Clears a static pod wedged in `CreateContainerError` after a backward clock step. Needs root and `crictl`. |
 | `build_cluster.sh` | Builds the cluster from a fresh machine: installs Ansible and its collections, repairs a half-configured apt source if an earlier run left one, runs `check_deployments.sh`, runs the playbook, then prints the finished cluster's end state. Run as the login user, not with `sudo`. Flags in [Bootstrap](#bootstrap). |
-| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning — then asserts the machine is actually clean. `--keep-packages` stops at the reset-and-clear-node-state line instead, leaving the packages and host tuning for the playbook to rebuild onto. Prompts before it starts; `-y`/`--yes` skips that. Leaves Ansible, chrony and Docker alone — but the `time-sync` drop-ins it wrote are host tuning and do go. Run as the login user, not with `sudo`. |
+| `destroy_cluster.sh` | Removes the cluster *and everything installed to run it* — packages, Helm, `crictl`, the apt repo, the host tuning, and the GPU Operator's node state under `/usr/local/nvidia` and `/run/nvidia` — then asserts the machine is actually clean. `--keep-packages` stops at the reset-and-clear-node-state line instead, leaving the packages and host tuning for the playbook to rebuild onto. Prompts before it starts; `-y`/`--yes` skips that. Leaves Ansible, chrony, Docker and the GPU driver alone — but the `time-sync` drop-ins it wrote are host tuning and do go. Run as the login user, not with `sudo`. |
 
 ### The clock
 

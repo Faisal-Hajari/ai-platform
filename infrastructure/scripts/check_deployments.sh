@@ -3,7 +3,8 @@
 # that have bitten this cluster before. Run before pushing changes to either half -- a
 # bad value here is accepted silently and only shows up later as a CrashLoop.
 #
-# Two halves, rendered identically because `helm template` is what both deployers do:
+# Two halves, rendered the way each deployer renders it -- `helm template` for both, but
+# with that deployer's release name and namespace, which some charts read:
 # infrastructure/k8s-ansible/system-apps/*/ is applied by the Ansible play (see
 # system-apps/README.md), and deployment/*/*/ is synced by ArgoCD. deployment/ is empty
 # today and that is not a failure -- the charts array below simply matches nothing there.
@@ -24,9 +25,11 @@ fail=0
 # values.yaml, so it needs the cilium chart's output to outlive the iteration that
 # produced it -- `render` is overwritten by every chart after it.
 ingress_render=$(mktemp)
-trap 'rm -f "$ingress_render"' EXIT
+gpu_render=$(mktemp)
+trap 'rm -f "$ingress_render" "$gpu_render"' EXIT
 
 cilium_dir=infrastructure/k8s-ansible/system-apps/cilium
+gpu_dir=infrastructure/k8s-ansible/system-apps/gpu-operator
 
 # Without nullglob an empty deployment/ hands the unexpanded pattern to helm, and the
 # run ends on helm's complaint about a directory named `*` -- an error that says nothing
@@ -54,7 +57,47 @@ for chart in "${charts[@]}"; do
   chart_fail=0
   echo "==> $dir"
   helm dependency update "$dir" >/dev/null
-  render=$(helm template "$(basename "$dir")" "$dir")
+
+  # Release name and namespace taken from the deployer rather than left to helm's defaults,
+  # because a chart can read either and these do. Not cosmetic: NVIDIA's charts call `fail`
+  # outright on `.Release.Namespace == "default"`, so a bare `helm template` would report a
+  # perfectly correct chart as broken -- and the reverse is the worse hazard, since a chart
+  # keying anything off the namespace would be checked in one nothing deploys it to.
+  #
+  # ArgoCD names the release after the Application, which the ApplicationSet template builds
+  # as `<path[1]>-<basename>`, and syncs it into namespace `<path[1]>`.
+  #
+  # For system-apps/ the namespace is read back out of the play rather than restated here,
+  # the same treatment the CI workflow gives helm_version. The variable name is derived from
+  # the directory -- system-apps/gpu-operator needs `gpu_operator_namespace` -- so adding a
+  # chart there means adding one var, not editing this script. A chart with no such var
+  # fails: the play could not deploy it either, and this is the cheap place to find out.
+  case "$dir" in
+    deployment/*)
+      namespace=$(basename "$(dirname "$dir")")
+      release="$namespace-$(basename "$dir")"
+      ;;
+    *)
+      release=$(basename "$dir")
+      # 2>&1, like every other python block here: sys.exit(msg) writes to stderr, so
+      # without it a missing var arrives as a blank FAIL with the reason discarded.
+      if ! namespace=$(SYSTEM_APP="$release" python3 - 2>&1 <<'NSPY'
+import os, pathlib, sys, yaml
+play = yaml.safe_load(pathlib.Path("infrastructure/k8s-ansible/playbook.yml").read_text())[0]
+var = os.environ["SYSTEM_APP"].replace("-", "_") + "_namespace"
+value = (play.get("vars") or {}).get(var)
+if not value:
+    sys.exit(f"playbook.yml declares no {var}")
+print(value)
+NSPY
+      ); then
+        echo "    FAIL: $namespace"
+        fail=1
+        continue
+      fi
+      ;;
+  esac
+  render=$(helm template "$release" "$dir" --namespace "$namespace")
 
   # These are umbrella charts: values only reach the upstream chart when they are
   # nested under the dependency's name. A top-level key that matches no dependency
@@ -85,6 +128,10 @@ PY
       chart_fail=1
     fi
     printf '%s\n' "$render" >"$ingress_render"
+  fi
+
+  if [ "$dir" = "$gpu_dir" ]; then
+    printf '%s\n' "$render" >"$gpu_render"
   fi
 
   if [ "$chart_fail" -eq 0 ]; then
@@ -291,6 +338,81 @@ else
   while IFS= read -r line; do
     echo "    FAIL: $line"
   done <<<"$pool_errors"
+  fail=1
+fi
+
+# The GPU invariant, and the second cross-file pair in this repo. The GPU Operator's
+# ClusterPolicy is where it is told which parts of the stack it owns, and two of those
+# answers are only correct relative to what the *playbook* does -- which the chart cannot
+# see and ArgoCD never reads.
+#
+# Asserted against the render rather than against values.yaml, because a value only matters
+# if it reaches the ClusterPolicy: a key nested wrong, or one the chart has since renamed,
+# reads perfectly in values.yaml and silently leaves the default in force. The ClusterPolicy
+# is what the operator actually acts on.
+#
+# Each of these fails late and confusingly without this check. driver.enabled would have the
+# Operator build a kernel module against a driver the play just asserted is already there;
+# toolkit.enabled off means nothing configures containerd at all, since the play
+# deliberately does not; devicePlugin.enabled off means the play's own gate waits twenty
+# minutes for a resource nothing will ever publish.
+echo "==> $gpu_dir (ClusterPolicy)"
+if gpu_errors=$(GPU_DIR="$gpu_dir" GPU_RENDER="$gpu_render" python3 - 2>&1 <<'GPUPY'
+import os, pathlib, sys, yaml
+
+chart = os.environ["GPU_DIR"]
+render = pathlib.Path(os.environ["GPU_RENDER"])
+
+errors = []
+try:
+    docs = [d for d in yaml.safe_load_all(render.read_text()) if isinstance(d, dict)]
+except (OSError, yaml.YAMLError) as exc:
+    docs = []
+    errors.append(f"the {chart} render could not be read: {exc}")
+
+if not docs:
+    errors.append(f"{chart} rendered nothing -- that chart is the whole GPU stack, and"
+                  " without it no model server can ever be scheduled")
+
+policies = [d for d in docs if d.get("kind") == "ClusterPolicy"]
+if docs and len(policies) != 1:
+    # The play's gate reads `kubectl get clusterpolicy` across all items; more than one
+    # would make that ambiguous, and none means nothing drives the operator at all.
+    errors.append(f"the {chart} render has {len(policies)} ClusterPolicy resources, and the"
+                  " playbook's GPU gate assumes exactly one")
+
+# (key path, required value, why)
+REQUIRED = [
+    (("driver", "enabled"), False,
+     "the playbook asserts a working host driver before it touches the machine, and the"
+     " Operator's driver component would build a second one as a container against the"
+     " same kernel"),
+    (("toolkit", "enabled"), True,
+     "the playbook deliberately configures nothing about containerd for GPUs -- the"
+     " Operator is the single writer of the runtime handler, and with this off there is"
+     " no writer at all"),
+    (("devicePlugin", "enabled"), True,
+     "it is what publishes nvidia.com/gpu, which the playbook's own gate waits twenty"
+     " minutes for before failing"),
+]
+for policy in policies:
+    spec = policy.get("spec") or {}
+    for path, required, why in REQUIRED:
+        component = spec.get(path[0])
+        actual = component.get(path[1]) if isinstance(component, dict) else None
+        if actual is not required:
+            errors.append(f"ClusterPolicy spec.{'.'.join(path)} is {actual!r}, must be"
+                          f" {required!r} -- {why}")
+
+print("\n".join(errors))
+sys.exit(1 if errors else 0)
+GPUPY
+); then
+  echo "    ok"
+else
+  while IFS= read -r line; do
+    echo "    FAIL: $line"
+  done <<<"$gpu_errors"
   fail=1
 fi
 

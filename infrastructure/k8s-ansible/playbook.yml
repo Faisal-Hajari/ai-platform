@@ -40,6 +40,20 @@
     system_apps_dir: "{{ playbook_dir }}/system-apps"
     cilium_chart_dir: "{{ system_apps_dir }}/cilium"
     argocd_chart_dir: "{{ system_apps_dir }}/argocd"
+    # The third member of system-apps/, admitted under the widened membership rule in
+    # system-apps/README.md: it writes node configuration, so it cannot be something a
+    # controller running on that node reconciles.
+    gpu_operator_chart_dir: "{{ system_apps_dir }}/gpu-operator"
+    # The namespace each system-apps chart is released into, declared here rather than
+    # written into the helm commands below. infrastructure/scripts/check_deployments.sh
+    # renders every chart the way its deployer will -- including the namespace, which some
+    # charts read and NVIDIA's refuse to default -- and it reads these keys back out of
+    # this file rather than restating them. The key name is derived from the directory, so
+    # system-apps/<name> needs <name-with-underscores>_namespace, and a chart without one
+    # fails that check rather than being rendered somewhere nothing deploys it.
+    cilium_namespace: kube-system
+    argocd_namespace: argocd
+    gpu_operator_namespace: gpu-operator
     # Ours to name -- nothing outside this play refers to it. ArgoCD finds it by label and
     # pairs it to a repository by URL, not by name.
     argocd_repo_secret_name: repo-ai-platform
@@ -279,6 +293,56 @@
         success_msg: >-
           Existing cluster already advertises {{ apiserver_advertise_address }}
       when: admin_conf.content is defined
+
+    # ── GPU ───────────────────────────────────────────────
+    # Here, beside the other host-identity asserts and ahead of everything that mutates the
+    # machine, for the reason stated above them: a box that cannot serve models should
+    # abort while it is still pristine, not after swap is off, /etc/fstab is rewritten and
+    # kubeadm is installed and held.
+    #
+    # The driver is the one part of the GPU stack this repo does not own. Everything above
+    # it -- the container toolkit, containerd's nvidia runtime handler, the RuntimeClass,
+    # the device plugin that publishes nvidia.com/gpu -- is installed by the GPU Operator
+    # in system-apps/gpu-operator/, deployed by this play further down. The driver is tied
+    # to the kernel and the card, installing one means owning reboots, and the Operator's
+    # own driver component is disabled in that chart's values.yaml for exactly that reason.
+    # So assert it, at the top, rather than discovering it from inside a validator pod that
+    # cannot start.
+    #
+    # `nvidia-smi -L` rather than a dpkg query or a stat of /proc/driver/nvidia/version,
+    # because it is the one check that answers all three ways this goes wrong: no driver at
+    # all, a driver whose kernel module is not loaded or has no card to bind to, and a
+    # userspace library that no longer matches the running module -- the "Driver/library
+    # version mismatch" an unattended driver upgrade leaves behind until the next reboot.
+    # The first two show up in the exit status; the third exits non-zero having listed no
+    # GPUs, so both halves of the assert are load-bearing.
+    - name: Check for an NVIDIA driver
+      command: nvidia-smi -L
+      register: nvidia_smi
+      changed_when: false
+      failed_when: false
+
+    # default([]) on stdout_lines, not decoration: when the binary is missing entirely the
+    # command module fails before it runs anything and returns rc with no stdout at all, so
+    # an unguarded filter chain raises inside the assert -- and inside fail_msg, which
+    # assert finalizes on every run, pass or fail.
+    - name: Assert this host has a usable NVIDIA GPU
+      vars:
+        gpus: "{{ nvidia_smi.stdout_lines | default([]) | select('match', 'GPU [0-9]+:') | list }}"
+      assert:
+        that:
+          - nvidia_smi.rc == 0
+          - gpus | length > 0
+        fail_msg: >-
+          `nvidia-smi -L` listed no GPU on this host. The GPU Operator this play deploys is
+          configured with driver.enabled=false, so it expects to find a working driver
+          here; without one its validator never passes, nvidia.com/gpu never appears, and
+          the gate at the end of that section fails after a long image pull. The driver is
+          not this repo's to install: install it (`ubuntu-drivers install`, or NVIDIA's own
+          packages) and reboot if the kernel module is not loaded. nvidia-smi said:
+          {{ (nvidia_smi.stderr | default('') | trim) or (nvidia_smi.stdout | default('') | trim)
+             or 'nothing at all -- it is probably not installed' }}
+        success_msg: "{{ gpus | length }} GPU(s) present: {{ gpus | join('; ') }}"
 
     # ── LoadBalancer announcement ─────────────────────────
     # config/ip-pool.yaml declares the addresses LB-IPAM hands out; config/l2-policy.yaml
@@ -1361,7 +1425,7 @@
     - name: Install or upgrade Cilium
       command: >-
         helm upgrade --install cilium {{ cilium_chart_dir }}
-        --namespace kube-system
+        --namespace {{ cilium_namespace }}
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
@@ -1521,6 +1585,142 @@
           {{ ingress_describe.stdout | default('', true) or ingress_ready.stderr }}
         success_msg: cilium-ingress is serving {{ ingress_pin }}
 
+    # ── GPU Operator ──────────────────────────────────────
+    # NVIDIA's GPU Operator, which is what actually makes a GPU schedulable. It installs the
+    # container toolkit onto the node, writes containerd's `nvidia` runtime handler, creates
+    # the RuntimeClass that selects it, and runs the device plugin that publishes
+    # nvidia.com/gpu into the node's allocatable resources -- plus DCGM metrics and node
+    # feature discovery, which are the two things it brings over a bare device plugin.
+    #
+    # Deployed by this play rather than by ArgoCD, which is why it is in system-apps/ at
+    # all. Its toolkit DaemonSet rewrites /etc/containerd and restarts containerd; putting
+    # that under the ApplicationSet would mean prune and selfHeal on the container runtime
+    # the reconciler is itself running on, which is the shape system-apps/ exists to
+    # prevent. The membership rule was widened for this deliberately -- see
+    # system-apps/README.md, which states the widened rule rather than leaving it implied.
+    #
+    # The play does NOT configure containerd for GPUs anywhere. That is the point of
+    # toolkit.enabled=true in the chart's values: one writer, the way Cilium has one
+    # renderer. If that value is ever turned off, this play has to grow the containerd
+    # configuration back, and check_deployments.sh fails rather than letting that happen
+    # quietly.
+    #
+    # Placed after Cilium and before ArgoCD. It needs a datapath and a Ready node, which the
+    # section above establishes; and its toolkit DaemonSet restarts containerd, which is
+    # cheaper to do with fewer workloads running than after ArgoCD is up. A containerd
+    # restart does not kill running containers -- the shims outlive it -- but the CRI is
+    # briefly unavailable and there is no reason to schedule that under a control plane
+    # doing more work than it has to.
+    - name: Read the GPU Operator chart's declared dependencies
+      set_fact:
+        gpu_operator_chart: "{{ lookup('file', gpu_operator_chart_dir + '/Chart.yaml') | from_yaml }}"
+
+    # Gated on the cache for the same reason as Cilium's: re-running this play is the only
+    # update path there is, and an unconditional resolve makes every re-run need
+    # nvidia.github.io reachable -- including one that changes nothing. Keyed on the exact
+    # name-version.tgz Chart.yaml declares, so bumping the pin resolves again.
+    - name: Check whether those dependencies are already in the chart's cache
+      stat:
+        path: "{{ gpu_operator_chart_dir }}/charts/{{ item.name }}-{{ item.version }}.tgz"
+      loop: "{{ gpu_operator_chart.dependencies | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}-{{ item.version }}"
+      become: false
+      register: gpu_operator_deps_cached
+
+    - name: Resolve the GPU Operator chart's dependencies
+      command: helm dependency update {{ gpu_operator_chart_dir }}
+      become: false
+      when: gpu_operator_deps_cached.results | rejectattr('stat.exists') | list | length > 0
+
+    # --create-namespace, unlike Cilium's release: kube-system already exists on any
+    # cluster, gpu-operator does not, and helm will not create a release namespace on its
+    # own. Done through helm rather than a `kubectl create namespace` task so the namespace
+    # belongs to the release and goes with a `helm uninstall`.
+    #
+    # No --wait, on the same reasoning as Cilium: what is worth waiting for is named
+    # explicitly below, where a failure can say which thing did not come up. Unlike Cilium,
+    # this chart DOES render helm.sh/hook resources -- a pre-upgrade Job that applies the
+    # new CRDs, and pre-delete/post-delete cleanup Jobs -- and helm waits for hooks whether
+    # or not --wait is set. So every re-run of this play runs that CRD Job and blocks on it,
+    # bounded by helm's default 5m timeout. That is the chart's own upgrade path for CRDs,
+    # which Helm otherwise never touches after first install, so it is worth the wait rather
+    # than something to skip.
+    #
+    # Reports changed on every run, honestly: helm has no cheap "would this change
+    # anything", and gating the upgrade on the rendered manifest matching the last release
+    # would skip the three-way merge that corrects drift -- which, with no reconciler behind
+    # this play, is the whole point of re-running.
+    - name: Install or upgrade the GPU Operator
+      command: >-
+        helm upgrade --install gpu-operator {{ gpu_operator_chart_dir }}
+        --namespace {{ gpu_operator_namespace }}
+        --create-namespace
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+
+    # The operator itself, and the node-feature-discovery master it reads labels from.
+    # Named rather than inferred, so a failure here says which Deployment did not roll out
+    # instead of timing out on the resource gate below with nothing to point at.
+    #
+    # NOT the DaemonSets that do the actual work -- the toolkit, the device plugin, DCGM.
+    # Those are not in this release at all: the operator creates them at runtime from the
+    # ClusterPolicy, so their names are the operator's to choose and waiting on them by name
+    # here would be asserting an implementation detail. The gate below asks about the
+    # outcome instead.
+    - name: Wait for the GPU Operator control plane
+      command: >-
+        kubectl rollout status deployment/{{ item }}
+        -n {{ gpu_operator_namespace }} --timeout=5m
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      loop:
+        - gpu-operator
+        - gpu-operator-node-feature-discovery-master
+      changed_when: false
+
+    # The end state, and the only claim that matters: the node advertises a GPU. Everything
+    # above is a means to this, and every one of them can succeed while this stays false --
+    # a toolkit DaemonSet that wrote containerd but could not restart it, a device plugin
+    # that came up without the nvidia runtime and so saw no devices, a driver validator that
+    # never passed. Each of those leaves a healthy-looking cluster where nothing can ever
+    # request a GPU, which is the exact failure this whole section exists to end.
+    #
+    # 20 minutes because this is a cold image pull on a first bootstrap: the toolkit,
+    # device plugin, DCGM exporter and validator images are several GB between them, and
+    # they are pulled serially as the operator rolls each component out. On a re-run the
+    # resource is already there and the first poll returns.
+    #
+    # The ClusterPolicy's own status is read only on failure. It is the operator's verdict
+    # on itself and names the component that is not ready, which is the one thing a bare
+    # timeout cannot say.
+    - name: Wait for the node to advertise a GPU
+      shell: |
+        set -eu
+        for _ in $(seq 120); do
+          gpus=$(kubectl get nodes \
+                   -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}' 2>/dev/null || true)
+          if [ -n "${gpus// /}" ]; then
+            echo "node allocatable nvidia.com/gpu: $gpus"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "no node advertises nvidia.com/gpu after 20 minutes." >&2
+        echo "ClusterPolicy status:" >&2
+        kubectl get clusterpolicy -o jsonpath='{.items[*].status}' >&2 || true
+        echo >&2
+        kubectl -n {{ gpu_operator_namespace }} get pods >&2 || true
+        exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      changed_when: false
+
     # ── ArgoCD ────────────────────────────────────────────
     - name: Create argocd namespace
       command: kubectl create namespace argocd
@@ -1579,7 +1779,7 @@
     - name: Install or upgrade ArgoCD
       command: >-
         helm upgrade --install argocd {{ argocd_chart_dir }}
-        --namespace argocd --timeout 10m
+        --namespace {{ argocd_namespace }} --timeout 10m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false

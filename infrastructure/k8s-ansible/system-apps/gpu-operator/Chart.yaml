@@ -1,0 +1,29 @@
+# Umbrella over NVIDIA's GPU Operator, same shape as system-apps/cilium: the dependency is
+# pinned to an exact version, values.yaml beside this file is the whole configuration, and
+# charts/ and Chart.lock are gitignored because they are resolution output rather than
+# source. The playbook resolves them on the node before `helm upgrade --install`.
+#
+# The Operator is what makes a GPU schedulable. It installs the NVIDIA container toolkit
+# onto the node, writes containerd's `nvidia` runtime handler, creates the RuntimeClass
+# that selects it, and runs the device plugin that publishes `nvidia.com/gpu` into the
+# node's allocatable resources. Without it `resources: {limits: {nvidia.com/gpu: 1}}` is a
+# request no node can satisfy and every model server sits Pending.
+#
+# It is in system-apps/ and not deployment/ because it writes node configuration -- see
+# the membership rule in ../README.md, which was widened for exactly this. The short
+# version: ArgoCD syncs deployment/ with prune and selfHeal, and the thing that rewrites
+# /etc/containerd should not be reconciled by a controller running on top of it.
+#
+# NOTE on CRDs: this chart ships them under crds/, which Helm installs on first install and
+# then never touches again -- `helm upgrade` does not upgrade CRDs. The chart works around
+# that itself with a `pre-upgrade` hook Job (gpu-operator-upgrade-crd) that applies the new
+# ones, so bumping the version here does carry its CRDs with it. The cost is that helm waits
+# for that Job on every upgrade, hooks being waited on whether or not --wait is set: see the
+# install task in ../../playbook.yml.
+apiVersion: v2
+name: gpu-operator
+version: 1.0.0
+dependencies:
+  - name: gpu-operator
+    version: v26.7.0
+    repository: https://nvidia.github.io/gpu-operator

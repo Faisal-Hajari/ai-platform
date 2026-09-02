@@ -1,0 +1,66 @@
+# Nested under the dependency's name, because that is the only way values reach an
+# umbrella chart's subchart. A top-level key here is not an error to Helm -- it is
+# silently ignored and the chart's own default applies instead, which is why
+# ../../../scripts/check_deployments.sh fails a values.yaml whose top-level keys match no
+# dependency.
+#
+# Everything not stated here is left at the Operator's defaults on purpose. The point of
+# adopting it is to run the standard NVIDIA stack rather than a hand-rolled one, so each
+# override below has to earn itself.
+gpu-operator:
+  # The driver is the host's. Left to its default (true) the Operator would install a
+  # driver *as a container*, which on a machine that already has one is not additive: the
+  # container builds and loads its own kernel module against the running kernel, and the
+  # host driver already occupying that slot is the failure. The playbook asserts a working
+  # `nvidia-smi -L` before it touches the machine, so the host driver is a precondition of
+  # the whole bootstrap rather than something to install twice.
+  #
+  # This is a supported configuration, not a workaround: it is the documented path for
+  # hosts with pre-installed drivers, and the Operator resolves the driver root itself.
+  driver:
+    enabled: false
+
+  # Left ENABLED, deliberately, and this is the decision the whole layout follows from.
+  # With the toolkit on, the Operator owns the container toolkit and containerd's `nvidia`
+  # runtime handler: its toolkit DaemonSet unpacks the toolkit into /usr/local/nvidia,
+  # writes a containerd drop-in and restarts containerd. That means the playbook does NOT
+  # configure containerd for GPUs -- there is exactly one writer, which is the same
+  # single-renderer rule Cilium is held to next door.
+  #
+  # Turning this off is the other documented path (both driver and toolkit pre-installed),
+  # and it is not free: NVIDIA's instructions for that case require the `nvidia` runtime to
+  # be containerd's DEFAULT runtime, which routes every pod on the node through
+  # nvidia-container-runtime rather than only the ones asking for a GPU. If it is ever
+  # turned off here, the playbook has to grow that configuration back and
+  # check_deployments.sh asserts it has not been turned off silently.
+  toolkit:
+    enabled: true
+
+  # MIG partitions a physical GPU into isolated instances, and it is an A100/H100 feature.
+  # This node's card has no MIG support, so the manager has nothing to manage: it would run
+  # as a DaemonSet, read a `nvidia.com/mig.config` label that is never set, and idle. Off
+  # is the honest state, and turning it back on is a one-line change if the hardware ever
+  # justifies it.
+  migManager:
+    enabled: false
+
+  # Deliberately left at the Operator's defaults, stated because each was considered:
+  #
+  #   devicePlugin    on. It is the component that publishes nvidia.com/gpu; the play
+  #                   asserts that resource appears, so this cannot be turned off quietly.
+  #   dcgmExporter    on. GPU utilisation, memory and temperature as Prometheus metrics.
+  #                   Nothing scrapes them yet -- there is no monitoring stack in
+  #                   deployment/ -- but it is one of the two things the Operator brings
+  #                   over a bare device plugin, and it costs one DaemonSet.
+  #   gfd / nfd       on. Node feature discovery labels the node with GPU model, memory and
+  #                   driver version. Nothing schedules on those labels today; they are
+  #                   what a second GPU node with a different card would need on day one.
+  #   cdi             on, and it is the Operator's default from this version. containerd
+  #                   2.x also enables CDI natively, so the two agree.
+  #
+  # No time-slicing or MPS. Both live under devicePlugin.config, and neither is enabled:
+  # this node has one card, and sharing it is a memory decision before it is a scheduling
+  # one. Time-slicing hands N pods the whole card with no memory isolation and no queueing,
+  # so two model servers that each fit alone OOM together -- and the failure lands on
+  # whichever pod allocates second, not on whoever oversubscribed. Until something needs to
+  # share the card, one GPU advertised as one GPU is the honest number.
