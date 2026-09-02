@@ -980,24 +980,29 @@
     # The pool and the L2 policy are CiliumLoadBalancerIPPool and
     # CiliumL2AnnouncementPolicy, and those CRDs are registered by cilium-operator at
     # runtime -- the chart does not ship them under crds/, so the rollout above says the
-    # operator is running, not that it has finished registering. Polling for the object
-    # first, then waiting on Established: `kubectl wait` errors immediately on a resource
-    # that is not there at all, so waiting alone would fail on exactly the cold run this
-    # exists for.
+    # operator is running, not that it has finished registering. Hence a wait at all.
+    #
+    # --for=create is what makes waiting alone sufficient: a bare
+    # --for=condition=established errors immediately on a CRD that is not there yet, which
+    # is exactly the cold run this exists for. Passing both makes kubectl wait for the
+    # object to appear first and only then for the condition -- in that order regardless of
+    # the order on the command line, which is why the two flags are not a race. That is a
+    # property of the kubectl this play pins (v1.36, from the apt repo added above), not of
+    # kubectl in general: this used to be a hand-rolled `get; sleep 2` loop for precisely
+    # that reason, and the loop stated its timeout in three places -- `seq`, `sleep` and
+    # the failure message -- with nothing keeping them in step. One --timeout= says it once
+    # and watches rather than polling on a 2-second granularity.
     - name: Wait for the Cilium CRDs the configuration below needs
-      shell: |
-        set -eu
-        for crd in ciliumloadbalancerippools.cilium.io ciliuml2announcementpolicies.cilium.io; do
-          for _ in $(seq 60); do
-            kubectl get crd "$crd" >/dev/null 2>&1 && break
-            sleep 2
-          done
-          kubectl wait --for=condition=established --timeout=60s crd/"$crd"
-        done
+      command: >
+        kubectl wait --for=create --for=condition=established
+        crd/{{ item }} --timeout=120s
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
       changed_when: false
+      loop:
+        - ciliumloadbalancerippools.cilium.io
+        - ciliuml2announcementpolicies.cilium.io
 
     # Part of the Cilium unit, not a thing of its own. The ingress pin in values.yaml has
     # to sit inside the pool declared here, and while these were two separately-synced
@@ -1016,6 +1021,14 @@
       register: cilium_config
       changed_when: cilium_config.stdout_lines | reject('search', ' unchanged$') | list | length > 0
 
+    # The address the wait below demands, read back out of the file the chart was rendered
+    # from rather than restated here -- the same argument as pod_cidr and
+    # apiserver_advertise_address at the top of this play. A restated pin is a second place
+    # to edit, and the failure of forgetting is a play that certifies the wrong address.
+    - name: Resolve the pinned ingress address
+      set_fact:
+        ingress_pin: "{{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips'] }}"
+
     # check_deployments.sh asserts statically that the ingress pin sits inside the pool;
     # this is the cluster confirming it. When they disagree LB-IPAM sets
     # IPAMRequestSatisfied=False on cilium-ingress, the Service never gets an address and
@@ -1024,30 +1037,49 @@
     # observe directly and used not to, so the run went green over a cluster whose ingress
     # had never come up, with nothing reconciling behind it to notice later.
     #
-    # A poll and an explicit message rather than `kubectl wait --for=jsonpath=...`: the
-    # thing worth having here is the reason, and a bare wait times out saying only that it
-    # did. If the Service is missing entirely the get fails under `set -e` -- that means
-    # ingressController.enabled was turned off, which check_deployments.sh fails on first.
+    # The wait is for the pinned address specifically, not for a non-empty one. This used
+    # to be a poll that exited on the first address it saw, so LB-IPAM serving *some*
+    # address -- out of a pool that does not contain the pin, say, after the pin moved and
+    # the old lease stayed -- read as success and every ingress hostname resolved somewhere
+    # else. `--for=jsonpath=<path>=<value>` is the same claim check_deployments.sh makes
+    # statically, made against the live Service.
+    #
+    # If the Service is missing entirely the wait errors rather than timing out -- that
+    # means ingressController.enabled was turned off, which check_deployments.sh fails on
+    # first. Either way the failure is reported by the assert below, which has the describe
+    # output the poll used to print; `kubectl wait` on its own says only that it timed out.
     - name: Wait for the ingress address to be served
-      shell: |
-        set -eu
-        for _ in $(seq 30); do
-          ip=$(kubectl -n kube-system get service cilium-ingress \
-                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          if [ -n "$ip" ]; then
-            echo "cilium-ingress is serving $ip"
-            exit 0
-          fi
-          sleep 2
-        done
-        echo "cilium-ingress still has no LoadBalancer address after 60s -- LB-IPAM has" >&2
-        echo "no pool that can serve the lbipam.cilium.io/ips pin in values.yaml." >&2
-        kubectl -n kube-system describe service cilium-ingress >&2
-        exit 1
+      command: >
+        kubectl -n kube-system wait service/cilium-ingress --timeout=60s
+        --for=jsonpath={.status.loadBalancer.ingress[0].ip}={{ ingress_pin }}
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
+      register: ingress_ready
       changed_when: false
+      failed_when: false
+
+    # The reason sits in the Service's conditions and events, not in the wait's exit code.
+    - name: Read the ingress Service
+      command: kubectl -n kube-system describe service cilium-ingress
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      become: false
+      when: ingress_ready.rc != 0
+      register: ingress_describe
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the ingress is serving the pinned address
+      assert:
+        that: ingress_ready.rc == 0
+        fail_msg: >-
+          cilium-ingress is not serving {{ ingress_pin }}, the lbipam.cilium.io/ips pin in
+          the chart's values.yaml, so every Ingress in this cluster answers on the wrong
+          address or on none at all. Either LB-IPAM has no pool that can serve the pin, or
+          something else already holds it:
+          {{ ingress_describe.stdout | default('', true) or ingress_ready.stderr }}
+        success_msg: cilium-ingress is serving {{ ingress_pin }}
 
     # ── ArgoCD ────────────────────────────────────────────
     - name: Create argocd namespace
