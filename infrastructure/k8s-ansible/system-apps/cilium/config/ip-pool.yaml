@@ -76,6 +76,12 @@ spec:
   # Service this address exists for, without depending on a label the upstream chart is
   # free to rename.
   #
+  # A selector is only a reservation while it names this Service and no other, so
+  # check_deployments.sh matches it against every Service in the render and fails one that
+  # catches more than the ingress: app.kubernetes.io/part-of: cilium, the other label this
+  # Service carries, is on all three and would reserve the address for a set rather than
+  # for the shared entrypoint.
+  #
   # Name and namespace together would be narrower still -- this matches a Service named
   # cilium-ingress in any namespace, and there is one. Name alone because check_deployments.sh
   # evaluates this selector against `helm template` output and renders every chart without

@@ -119,16 +119,22 @@ done
 # None of the three self-heals, and all of it is static YAML, so assert it here instead of
 # learning it from the cluster.
 #
-# Two things exclusivity does not read. How *widely* a matching selector is drawn: a pool
-# selecting on a label other Services could also carry counts as a reservation here.
+# How *widely* a reserving selector is drawn is asked of the render rather than assumed: a
+# selector that also matches another Service the chart renders is proven broad and fails.
+# One-sided by construction -- it cannot prove a selector narrow, because the cluster holds
+# Services this never sees -- but broad is the direction that turns a reservation into a
+# fiction, and app.kubernetes.io/part-of=cilium is on all three Services this chart renders
+# and reads exactly like a reservation until something asks.
+#
+# Two things stay open, and are limits of this script rather than of the idea. Namespace:
 # config/ip-pool.yaml selects on io.kubernetes.service.name, which names one Service per
-# namespace; name *and* namespace would be narrower still, and is not used only because
-# this script renders with no --namespace while the play installs into kube-system, so the
-# render cannot answer the namespace half. That is a property of how the render is made
-# here rather than of `helm template` -- passing the play's namespace to the cilium render
-# would close it, at the cost of making the namespace a per-chart value in the loop above.
-# And a pool that exists in the cluster but not in git: `kubectl apply -f` has no prune, so
-# one deleted or renamed here can outlive its manifest and go on handing out the pin.
+# namespace, and name *and* namespace would be narrower still -- not used only because this
+# script renders with no --namespace while the play installs into kube-system, so the render
+# cannot answer the namespace half. That is a property of how the render is made here rather
+# than of `helm template`: passing the play's namespace to the cilium render would close it,
+# at the cost of making the namespace a per-chart value in the loop above. And a pool that
+# exists in the cluster but not in git: `kubectl apply -f` has no prune, so one deleted or
+# renamed here can outlive its manifest and go on handing out the pin.
 #
 # The pool also has to be announced, and that is a second invariant with a worse failure
 # than the first: without a CiliumL2AnnouncementPolicy covering LoadBalancer addresses,
@@ -270,6 +276,8 @@ def selector_verdict(selector, labels):
 # this Service, and there is nothing to judge it against until its labels are in hand.
 pin = None
 svc_labels = None
+other_services = {}   # every other Service in the render, by name, with the labels a pool
+                      # selector is matched against
 try:
     docs = [d for d in yaml.safe_load_all(render.read_text()) if isinstance(d, dict)]
 except (OSError, yaml.YAMLError) as exc:
@@ -293,6 +301,17 @@ else:
         labels.update(metadata.get("labels") or {})
     labels[NAME_LABEL] = INGRESS_SERVICE
     svc_labels = {k: label_value(v) for k, v in labels.items()}
+    # The rest of the render's Services, labelled the same way, so a selector that claims
+    # to reserve an address for the ingress can be asked whether it also matches something
+    # else. Every Service, not only the LoadBalancers: see the pool loop.
+    for doc in docs:
+        metadata = doc.get("metadata") or {}
+        name = metadata.get("name")
+        if doc.get("kind") != "Service" or name == INGRESS_SERVICE or not name:
+            continue
+        other = {k: label_value(v) for k, v in (metadata.get("labels") or {}).items()}
+        other[NAME_LABEL] = name
+        other_services[name] = other
     pin = annotations.get("lbipam.cilium.io/ips")
     if not pin:
         # Not merely cosmetic, and not a vacuous pass to skip over: unpinned, the shared
@@ -331,9 +350,11 @@ for path, doc in config_docs:
     # over in silence, because an operator who meant it to serve the ingress is owed the
     # reason it did not count.
     live, serves_ingress, reserved = True, True, False
+    also_matches = []
+    disabled = bool(spec.get("disabled"))
     open_reason = "has no serviceSelector"
     selector = spec.get("serviceSelector")
-    if spec.get("disabled"):
+    if disabled:
         skipped.append(f"{name} (disabled)")
         live, serves_ingress = False, False
     # spec.serviceSelector narrows a pool to the Services it matches, which is both how a
@@ -364,6 +385,23 @@ for path, doc in config_docs:
             if not narrowing:
                 open_reason = "has an empty serviceSelector, which Cilium reads as match-all,"
             serves_ingress, reserved = verdict, verdict and narrowing
+            # Whether the selector that reserves an address also matches something else.
+            # "Does this match more than one Service in the cluster" is not a question a
+            # check over files can answer; "does it also match another Service in this
+            # render" is, and it is one-sided in the safe direction -- it cannot prove a
+            # selector narrow, but it can prove one broad, which is the direction that
+            # turns a reservation into a fiction. app.kubernetes.io/part-of=cilium is on
+            # all three Services this chart renders and reads exactly like a reservation
+            # until something asks.
+            #
+            # Every Service in the render, not only the LoadBalancers: cilium-envoy and
+            # hubble-peer take nothing from the ingress today because nothing allocates
+            # them an address. A selector that names something other than the ingress is
+            # worth failing on before an upstream chart turns one of them into a
+            # LoadBalancer, not after.
+            if reserved:
+                also_matches = sorted(name for name, other in other_services.items()
+                                      if selector_verdict(selector, other) is True)
     # Quoted "No" arrives as a string, bare No as False -- the field is a string
     # enum, but nothing stops the YAML from being written either way.
     allow_first_last = str(spec.get("allowFirstLastIPs", "Yes")).lower() not in ("no", "false")
@@ -376,6 +414,7 @@ for path, doc in config_docs:
         blocks.append({"pool": name, "label": label, "first": first, "last": last,
                        "span": (span_first, span_last), "live": live,
                        "serves_ingress": serves_ingress, "reserved": reserved,
+                       "also_matches": also_matches, "disabled": disabled,
                        "open_reason": open_reason})
 
 # What announces those addresses. loadBalancerIPs is the field that matters: a policy
@@ -420,12 +459,15 @@ if not announcers:
 # from one pool are checked too, and the message says which case it is.
 def overlap_label(block):
     first, last = block["span"]
+    # Named, because an operator who disabled a pool on purpose and is then told it
+    # conflicts will otherwise go looking for the reason in the wrong place.
+    disabled = " [spec.disabled, which the conflict pass does not exempt]" if block["disabled"] else ""
     if (first, last) == (block["first"], block["last"]):
-        return block["label"]
+        return block["label"] + disabled
     # allowFirstLastIPs withheld the ends of this CIDR, so the label spells a narrower
     # range than the one that conflicts. Say both, or an overlap reported at an address
     # outside the block it names reads as a broken checker.
-    return f"{block['label']} [whole range {first}-{last}]"
+    return f"{block['label']} [whole range {first}-{last}]" + disabled
 
 for index, one in enumerate(blocks):
     for two in blocks[index + 1:]:
@@ -478,6 +520,14 @@ for text in str(pin or "").split(","):
     for block in covering:
         label, open_reason = block["label"], block["open_reason"]
         if block["reserved"]:
+            if block["also_matches"]:
+                errors.append(
+                    f"ingress pin {ip} is inside {label}, whose serviceSelector matches"
+                    f" {', '.join(block['also_matches'])} in the cilium render as well as"
+                    f" {INGRESS_SERVICE} -- so it reserves the address for a set of"
+                    " Services, not for the shared entrypoint, and any of them that"
+                    " becomes a LoadBalancer can be handed the pin (#69). Select on"
+                    f" {NAME_LABEL}, or on a label only {INGRESS_SERVICE} carries.")
             continue
         if block["serves_ingress"]:
             errors.append(
