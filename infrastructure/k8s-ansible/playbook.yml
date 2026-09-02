@@ -876,19 +876,36 @@
     # every failure path.
     #
     # The two checks before the mv are what make the temp file worth having, and they are
-    # the ones a non-zero exit does not cover. `-s` catches a command that exits 0 having
-    # written nothing. The grep catches one that exits 0 having written something without
-    # the key this whole block exists to set -- a future default layout that renames it,
-    # say. Both would otherwise land as an assert failure 30 lines below, over a config
-    # that had already been replaced by the thing that failed it.
+    # the ones a non-zero exit does not cover: a command that exits 0 having written
+    # nothing, and one that exits 0 having written something without the key this whole
+    # block exists to set -- a future default layout that renames it, say. Both would
+    # otherwise land as an assert failure 30 lines below, over a config that had already
+    # been replaced by the thing that failed it.
+    #
+    # Each carries its own message because a bare `[ -s ]` or `grep -q` failing under -e
+    # gives the operator `rc: 1` with empty stdout and empty stderr and the whole script
+    # echoed back -- strictly less than the assert it displaces, which at least has a
+    # fail_msg. The messages are also what keeps `-s` worth its line: `grep -q` returns 1
+    # on an empty file too, so it already covers that case, and the only thing `-s` adds
+    # is telling the two apart. They point at different problems -- a containerd that
+    # produced nothing at all, versus one whose output this play no longer understands --
+    # so it is worth saying which happened.
     - name: Generate default containerd config
       shell: |
         set -euo pipefail
         tmp=$(mktemp -p /etc/containerd config.toml.XXXXXX)
         trap 'rm -f "$tmp"' EXIT
         containerd config default > "$tmp"
-        [ -s "$tmp" ]
-        grep -q SystemdCgroup "$tmp"
+        [ -s "$tmp" ] || {
+          echo "containerd config default exited 0 and wrote nothing;" \
+               "leaving /etc/containerd/config.toml alone" >&2
+          exit 1
+        }
+        grep -q SystemdCgroup "$tmp" || {
+          echo "containerd config default produced no SystemdCgroup key;" \
+               "leaving /etc/containerd/config.toml alone" >&2
+          exit 1
+        }
         chmod 0644 "$tmp"
         mv "$tmp" /etc/containerd/config.toml
         trap - EXIT
