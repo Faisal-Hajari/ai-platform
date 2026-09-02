@@ -51,7 +51,10 @@ spec:
     # The general pool: no serviceSelector, so any LoadBalancer Service can be allocated
     # out of it -- which is exactly why it starts above the pinned address rather than at
     # it. Keep it clear of anything ingress-pool below reserves;
-    # infrastructure/scripts/check_deployments.sh fails when the two overlap.
+    # infrastructure/scripts/check_deployments.sh fails on any two pool blocks that
+    # overlap, at the pinned address or anywhere else. Cilium's own answer to an overlap is
+    # to mark one of the two pools Conflicting and disable every range it has, so a widened
+    # reservation does not merely blur the split -- it can switch the reservation off.
     #
     # Written as start/stop, not a CIDR, because .201-.215 is not one. An earlier revision
     # wrote the range as "192.168.100.200/28", which LB-IPAM normalized to
@@ -73,11 +76,14 @@ spec:
   # Service this address exists for, without depending on a label the upstream chart is
   # free to rename.
   #
-  # Name and not namespace, deliberately: check_deployments.sh evaluates this selector
-  # against `helm template` output, and a bare render carries the release namespace
-  # (default) rather than the kube-system the play installs into. A selector this repo's
-  # own check cannot evaluate is a reservation nothing verifies, which is the situation
-  # this pool exists to end. The check fails on a namespace selector rather than guessing.
+  # Name and namespace together would be narrower still -- this matches a Service named
+  # cilium-ingress in any namespace, and there is one. Name alone because check_deployments.sh
+  # evaluates this selector against `helm template` output and renders every chart without
+  # --namespace, so the Service arrives stamped `default` rather than the kube-system the
+  # play installs into. A selector this repo's own check cannot evaluate is a reservation
+  # nothing verifies, which is the situation this pool exists to end, so the check refuses a
+  # namespace selector rather than guessing at it. Giving that render loop a per-chart
+  # namespace is what would let this say both.
   serviceSelector:
     matchLabels:
       io.kubernetes.service.name: cilium-ingress

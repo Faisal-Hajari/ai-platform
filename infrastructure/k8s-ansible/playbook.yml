@@ -495,7 +495,8 @@
                           first = ipaddress.ip_address(block["start"])
                           last = (ipaddress.ip_address(block["stop"])
                                   if block.get("stop") else first)
-                          label = "%s: %s-%s" % (name, first, last)
+                          label = ("%s: %s" % (name, first) if first == last
+                                   else "%s: %s-%s" % (name, first, last))
                   except (KeyError, TypeError, ValueError) as exc:
                       malformed.append("%s block %d (%s): %r" % (name, index, exc, block))
                       continue

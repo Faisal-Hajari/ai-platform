@@ -100,8 +100,8 @@ The order the play uses is load-bearing and worth knowing before editing it:
    runtime; the chart does not ship them under `crds/`.
 4. `kubectl apply -f config/`.
 5. Wait for `cilium-ingress` to be served an address — the pinned one, not merely some
-   address. A pin no pool will serve it, whether outside every pool or already given away
-   by one, leaves LB-IPAM with `IPAMRequestSatisfied=False`, no address on the Service, and
+   address. A pin no pool will serve — whether outside every pool, or already given away by
+   one — leaves LB-IPAM with `IPAMRequestSatisfied=False`, no address on the Service, and
    every Ingress in the cluster dead — with no reconciler behind the play, a run that went
    green here would be the last thing to notice.
 
