@@ -155,10 +155,11 @@
       set_fact:
         apiserver_advertise_address: "{{ cilium_values.cilium.k8sServiceHost }}"
 
-    # Every interface on this host, cut down to the three keys anything below reads.
-    # Two checks want it: the API server asserts want the LAN NICs, and the LoadBalancer
-    # announcement check further down wants all of them. The projection is also what
-    # makes handing the second one to a subprocess as JSON cheap -- the raw facts carry a
+    # Every interface on this host, cut down to the keys anything below reads. Two checks
+    # want it: the API server asserts want the LAN NICs, and the LoadBalancer announcement
+    # check further down wants those same NICs plus enough to tell a bridge and its ports
+    # from a NIC Cilium would actually announce on. The projection is also what makes
+    # handing the second one to a subprocess as JSON cheap -- the raw facts carry a
     # `features` map of a few hundred keys per NIC.
     #
     # regex_replace before extract because the two spellings differ. `interfaces` holds
@@ -173,7 +174,8 @@
           {{ ansible_facts['interfaces'] | map('regex_replace', '-', '_')
              | map('extract', ansible_facts)
              | map('dict2items')
-             | map('selectattr', 'key', 'in', ['device', 'ipv4', 'ipv4_secondaries'])
+             | map('selectattr', 'key', 'in',
+                   ['device', 'ipv4', 'ipv4_secondaries', 'type', 'interfaces', 'slaves'])
              | map('items2dict') | list }}
 
     # Not ansible_all_ipv4_addresses: that includes cilium_host, whose /32 out of the pod
@@ -182,6 +184,11 @@
     # interfaces Cilium and the container runtime create. Deliberately NOT narrowed to
     # ansible_default_ipv4.address: binding a non-default NIC is a legitimate thing to
     # want on a multi-NIC box, and this check should not forbid it.
+    #
+    # Two consumers now: the asserts just below, and the LoadBalancer announcement check
+    # further down. One list suits both because the reject pattern is the same set Cilium
+    # itself refuses to auto-select devices from -- cilium_, lo, lxc, cni, docker -- so an
+    # interface dropped here is one it would never answer ARP on either.
     - name: Resolve the NICs that could carry the API server address
       set_fact:
         node_lan_nics: >-
@@ -286,19 +293,49 @@
     # repo and the machine, so a renumbered LAN should abort a pristine host rather than
     # one that has already had swap disabled, kubeadm installed and a cluster built.
     #
+    # It runs per host, which is what lets the checker below skip spec.nodeSelector: while
+    # every node in the inventory announces every policy, "whether" cannot differ between
+    # them and only "where" is left to ask. Add a second node and that stops holding --
+    # a policy scoped to node A would abort the play on node B for not having a NIC on the
+    # pool's subnet, which is correct configuration failing a check. Whoever adds one has
+    # to teach this task the selector, or scope the task to the nodes a policy selects.
+    #
     # Read on the controller, like the values file above, so the parsing happens where
     # PyYAML is Ansible's own dependency rather than something the target has to have.
     # *.yaml and *.yml both, because `kubectl apply -f config/` applies both spellings and
     # reading only half of them would let a pool look homeless when it is not.
-    - name: Read the Cilium LoadBalancer configuration
-      set_fact:
-        cilium_config_docs: >-
-          {{ (cilium_config_docs | default([]))
-             + (lookup('file', item) | from_yaml_all | list) }}
-      loop: "{{ query('fileglob', cilium_chart_dir + '/config/*.yaml',
-                                  cilium_chart_dir + '/config/*.yml') | sort }}"
-      loop_control:
-        label: "{{ item | basename }}"
+    #
+    # Wrapped in a rescue because a manifest that does not parse raises inside the Jinja
+    # expression, and what reaches the operator is `can only concatenate list (not
+    # "CapturedExceptionMarker") to list` -- true, and no help at all. The failed loop
+    # results carry the item, so the rescue can say which file it was.
+    - block:
+        - name: Read the Cilium LoadBalancer configuration
+          set_fact:
+            cilium_config_docs: >-
+              {{ (cilium_config_docs | default([]))
+                 + (lookup('file', item) | from_yaml_all | list) }}
+          loop: "{{ query('fileglob', cilium_chart_dir + '/config/*.yaml',
+                                      cilium_chart_dir + '/config/*.yml') | sort }}"
+          loop_control:
+            label: "{{ item | basename }}"
+      rescue:
+        - name: Name the Cilium manifest that could not be parsed
+          vars:
+            unparseable: >-
+              {{ ansible_failed_result.results | default([])
+                 | selectattr('failed', 'defined') | selectattr('failed')
+                 | map(attribute='item') | list }}
+          fail:
+            msg: >-
+              {{ unparseable | join(', ') if unparseable
+                 else cilium_chart_dir + '/config' }} is not valid YAML, so the pool and
+              the policy that announces it cannot be checked -- and `kubectl apply -f
+              config/` would not have applied it either. The parser's own message is not
+              in the failure above and cannot be recovered here, because the exception is
+              swallowed inside the template; `bash
+              infrastructure/scripts/check_deployments.sh` reads the same directory and
+              prints it.
 
     # `python3 -` with the program on stdin rather than a shell heredoc: the heredoc would
     # become the task's `cmd`, so every failure would print the whole checker back at the
@@ -315,6 +352,28 @@
           nics = json.loads(os.environ["NODE_NICS"])
           config_dir = os.environ["CILIUM_CONFIG_DIR"]
 
+          # Cilium does not offer spec.interfaces every interface on the box to match
+          # against. Its device controller auto-selects, and refuses bridges outright
+          # ("bridge-like device, use --devices to override") along with anything enslaved
+          # to a bridge or a bond; the families it excludes by name are already gone from
+          # the list handed in here. Matching against everything instead would report a
+          # pool as announced when it sits on, say, a libvirt bridge -- which is this
+          # task's own failure mode reached from the other side, and worse than not
+          # checking, because it says so in prose.
+          #
+          # An approximation of that selection and not a copy of it: Cilium also drops
+          # devices with no route, and cilium.devices in values.yaml (unset here) replaces
+          # the whole auto-detection. Both would make this refuse a pool the cluster would
+          # have announced -- wrong in the direction that fails loudly, which is the one
+          # this task can afford, and the failure names the interfaces it did consider.
+          enslaved = set()
+          for nic in nics:
+              enslaved.update(nic.get("interfaces") or [])   # bridge ports
+              enslaved.update(nic.get("slaves") or [])       # bond members
+          candidates = [nic for nic in nics if nic.get("device")
+                        and nic.get("type") != "bridge"
+                        and nic["device"] not in enslaved]
+
           # Which interfaces will answer ARP for a LoadBalancer address. spec.interfaces
           # is a list of regular expressions matched unanchored -- Cilium compiles each
           # with Go's regexp and asks MatchString, and re.search is that same question, so
@@ -324,7 +383,9 @@
           # spec.nodeSelector and spec.serviceSelector are deliberately not read. They
           # decide *whether* a policy announces, not *where*; this asks only whether the
           # pool is reachable if it announces at all, and a policy narrowed until it
-          # announces nothing is a different bug that this does not claim to catch.
+          # announces nothing is a different bug that this does not claim to catch. See
+          # the note above this task for why skipping nodeSelector is safe only while
+          # every node in the inventory announces every policy.
           announced = set()   # every interface some policy will answer on
           announcers = 0
           for doc in docs:
@@ -353,9 +414,9 @@
                   print("%s: spec.interfaces is not a list of regular expressions (%s)"
                         % (name, exc), file=sys.stderr)
                   sys.exit(1)
-              for nic in nics:
-                  device = nic.get("device")
-                  if device and (not matchers or any(m.search(device) for m in matchers)):
+              for nic in candidates:
+                  device = nic["device"]
+                  if not matchers or any(m.search(device) for m in matchers):
                       announced.add(device)
 
           # The subnets those interfaces are attached to. Both ipv4 and ipv4_secondaries,
@@ -365,7 +426,7 @@
           # perfectly announceable.
           subnets = []   # (label, network)
           for device in sorted(announced):
-              nic = next(n for n in nics if n.get("device") == device)
+              nic = next(n for n in candidates if n["device"] == device)
               entries = [nic["ipv4"]] if isinstance(nic.get("ipv4"), dict) else []
               entries += [e for e in (nic.get("ipv4_secondaries") or []) if isinstance(e, dict)]
               for entry in entries:
@@ -389,7 +450,8 @@
           # only ever shrink a block -- so checking the wider range is the safe direction
           # and needs neither.
           blocks = []
-          unread = []   # blocks this check is not equipped to read, kept for the message
+          unread = []      # blocks this check is not equipped to read, kept for the message
+          malformed = []   # blocks nothing could read, which is a failure of its own
           for doc in docs:
               if not isinstance(doc, dict) or doc.get("kind") != "CiliumLoadBalancerIPPool":
                   continue
@@ -397,7 +459,7 @@
               spec = doc.get("spec") or {}
               if spec.get("disabled"):
                   continue
-              for block in spec.get("blocks") or []:
+              for index, block in enumerate(spec.get("blocks") or []):
                   try:
                       if "cidr" in block:
                           # strict=False because that is what LB-IPAM does: it normalizes
@@ -411,15 +473,24 @@
                           first = ipaddress.ip_address(block["start"])
                           last = ipaddress.ip_address(block["stop"])
                           label = "%s: %s-%s" % (name, first, last)
-                  except (KeyError, TypeError, ValueError):
-                      # A malformed block is check_deployments.sh's to report, with the
-                      # better message for it. Saying it again here only buries that one.
+                  except (KeyError, TypeError, ValueError) as exc:
+                      malformed.append("%s block %d (%s): %r" % (name, index, exc, block))
                       continue
                   # IPv4 only, because the facts this is handed are. An IPv6 block would
                   # fail containment against a set of subnets that was never going to hold
                   # it, and the message would be a confident lie about the network rather
                   # than an admission of this check's reach.
                   (blocks if first.version == 4 else unread).append((label, first, last))
+
+          # Ahead of the "no usable block" message below, which would otherwise be the
+          # one an operator gets for a pool whose only block is a typo -- and it points at
+          # the wrong file. check_deployments.sh says this better and says it sooner, but
+          # the play cannot assume it was run: build_cluster.sh --skip-render-check exists
+          # precisely to skip it.
+          if malformed:
+              print("CiliumLoadBalancerIPPool block(s) under %s cannot be read: %s"
+                    % (config_dir, "; ".join(malformed)), file=sys.stderr)
+              sys.exit(1)
 
           if not blocks:
               if unread:
@@ -440,10 +511,10 @@
               reason = ("no CiliumL2AnnouncementPolicy under %s sets loadBalancerIPs: true"
                         % config_dir)
           elif not announced:
-              reason = ("the policies under %s name interfaces that match nothing on this"
-                        " host, which has %s"
+              reason = ("the policies under %s name interfaces that match none of the ones"
+                        " Cilium would announce on here (%s)"
                         % (config_dir,
-                           ", ".join(sorted(n["device"] for n in nics if n.get("device")))))
+                           ", ".join(sorted(n["device"] for n in candidates)) or "none"))
           elif not subnets:
               reason = ("the policies under %s announce on %s, and none of those holds an"
                         " IPv4 address" % (config_dir, ", ".join(sorted(announced))))
@@ -473,9 +544,12 @@
           print("%s is announced on %s"
                 % (", ".join(label for label, _, _ in blocks), announced_on))
       environment:
-        CILIUM_CONFIG: "{{ cilium_config_docs | to_json }}"
+        # default([]) because the fact is only ever set inside the loop above: an empty
+        # config/ leaves it undefined, and templating this would die on an undefined
+        # variable instead of reaching the checker's own account of what is missing.
+        CILIUM_CONFIG: "{{ cilium_config_docs | default([]) | to_json }}"
         CILIUM_CONFIG_DIR: "{{ cilium_chart_dir }}/config"
-        NODE_NICS: "{{ node_nics | to_json }}"
+        NODE_NICS: "{{ node_lan_nics | to_json }}"
       changed_when: false
 
     # ── Ingress pin ───────────────────────────────────────
