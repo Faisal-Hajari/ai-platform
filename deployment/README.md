@@ -30,4 +30,7 @@ Adding a chart:
 away with the move — it would now fire on every run — which means a chart *disappearing*
 from here is no longer reported by anything. The Cilium half is still covered, by the
 cross-file pool check that names the chart it needs; nothing equivalent guards a future
-entry, so notice it when the first one lands.
+entry, so notice it when the first one lands. Tracked as #52, which also covers the wider
+version of the same hole: the generator matches *directories*, while the check only reads
+`Chart.yaml`, so a directory of plain manifests here syncs with `prune` and `selfHeal` and
+is rendered by nothing.
