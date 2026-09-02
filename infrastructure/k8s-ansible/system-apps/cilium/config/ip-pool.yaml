@@ -82,6 +82,12 @@ spec:
   # Service carries, is on all three and would reserve the address for a set rather than
   # for the shared entrypoint.
   #
+  # It also fails a selector built only of NotIn and DoesNotExist terms, which is the one
+  # shape the render cannot judge: `DoesNotExist: k8s-app` matches only this Service among
+  # the three rendered -- the other two carry that label -- and matches nearly every
+  # Service in the cluster. So name something positively here; excluding what you know
+  # about bounds nothing.
+  #
   # Name and namespace together would be narrower still -- this matches a Service named
   # cilium-ingress in any namespace, and there is one. Name alone because check_deployments.sh
   # evaluates this selector against `helm template` output and renders every chart without

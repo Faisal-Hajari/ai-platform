@@ -119,12 +119,16 @@ done
 # None of the three self-heals, and all of it is static YAML, so assert it here instead of
 # learning it from the cluster.
 #
-# How *widely* a reserving selector is drawn is asked of the render rather than assumed: a
-# selector that also matches another Service the chart renders is proven broad and fails.
-# One-sided by construction -- it cannot prove a selector narrow, because the cluster holds
-# Services this never sees -- but broad is the direction that turns a reservation into a
+# How *widely* a reserving selector is drawn is asked twice, because neither question
+# covers the other. Of the render: a selector that also matches another Service the chart
+# renders is proven broad and fails -- one-sided by construction, since the cluster holds
+# Services this never sees, but broad is the direction that turns a reservation into a
 # fiction, and app.kubernetes.io/part-of=cilium is on all three Services this chart renders
-# and reads exactly like a reservation until something asks.
+# and reads exactly like a reservation until something asks. And of its shape: a selector
+# needs one positive term, because NotIn and DoesNotExist only remove Services from a set
+# nothing bounded. That one cannot come from the render -- `DoesNotExist: k8s-app` matches
+# only cilium-ingress here, since the other two Services carry that label, so the render
+# calls it narrow while the cluster hands it nearly everything.
 #
 # Two things stay open, and are limits of this script rather than of the idea. Namespace:
 # config/ip-pool.yaml selects on io.kubernetes.service.name, which names one Service per
@@ -213,6 +217,34 @@ def label_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+def selector_bounds(selector):
+    """None if the selector bounds what it matches, else the clause saying why it does not.
+
+    A reservation is a claim that one Service and no other can be given an address, so the
+    selector has to bound the set it matches: at least one positive term -- a matchLabels
+    entry, an In, or an Exists. NotIn and DoesNotExist only ever remove Services from a set
+    nothing bounded, so a selector built of those alone matches nearly everything.
+
+    Asked by shape rather than of the render, because the render is exactly what cannot see
+    it. `DoesNotExist: k8s-app` matches only cilium-ingress among the three Services this
+    chart renders -- the other two carry that label -- so the breadth check below reports it
+    as matching one Service and would wave it through, while in the cluster it matches
+    nearly every Service there is. Its narrowness is an accident of what happens to be in
+    the render.
+    """
+    match_labels = selector.get("matchLabels") or {}
+    expressions = [e for e in (selector.get("matchExpressions") or []) if isinstance(e, dict)]
+    if not match_labels and not expressions:
+        # Cilium's match-all: LabelSelectorAsSelector of an empty selector is
+        # labels.Everything(), so this is not a narrowing at all.
+        return ("has an empty serviceSelector, which Cilium reads as match-all, so it serves"
+                " every LoadBalancer Service")
+    if not (match_labels or any(e.get("operator") in ("In", "Exists") for e in expressions)):
+        return ("has a serviceSelector of only NotIn and DoesNotExist terms, which remove"
+                " Services from a set nothing bounded -- so it serves every LoadBalancer"
+                " Service those terms do not name")
+    return None
 
 def selector_verdict(selector, labels):
     """True, False, or a string saying why a render cannot answer the question.
@@ -352,7 +384,7 @@ for path, doc in config_docs:
     live, serves_ingress, reserved = True, True, False
     also_matches = []
     disabled = bool(spec.get("disabled"))
-    open_reason = "has no serviceSelector"
+    open_reason = "has no serviceSelector and so serves every LoadBalancer Service"
     selector = spec.get("serviceSelector")
     if disabled:
         skipped.append(f"{name} (disabled)")
@@ -377,14 +409,14 @@ for path, doc in config_docs:
             if not verdict:
                 skipped.append(f"{name} (serviceSelector does not match the rendered"
                                f" {INGRESS_SERVICE} Service)")
-            # An empty selector, or one whose matchLabels and matchExpressions are both
-            # empty, is Cilium's match-all rather than a narrowing: it matches the ingress
-            # and everything else too, so it reserves nothing.
-            narrowing = bool((selector.get("matchLabels") or {})
-                             or (selector.get("matchExpressions") or []))
-            if not narrowing:
-                open_reason = "has an empty serviceSelector, which Cilium reads as match-all,"
-            serves_ingress, reserved = verdict, verdict and narrowing
+            # Matching the ingress is not enough to be a reservation: the selector also
+            # has to bound what else it can match. Both ways of failing that are the same
+            # failure for the pin, so they share the message below and differ only in the
+            # clause selector_bounds hands back.
+            bounds = selector_bounds(selector)
+            if bounds:
+                open_reason = bounds
+            serves_ingress, reserved = verdict, verdict and bounds is None
             # Whether the selector that reserves an address also matches something else.
             # "Does this match more than one Service in the cluster" is not a question a
             # check over files can answer; "does it also match another Service in this
@@ -531,13 +563,12 @@ for text in str(pin or "").split(","):
             continue
         if block["serves_ingress"]:
             errors.append(
-                f"ingress pin {ip} is inside {label}, which {open_reason} and so"
-                " serves every LoadBalancer Service. LB-IPAM can hand that address to the"
-                " next Service that asks for one, and will not evict it to satisfy the pin"
-                " -- cilium-ingress then sits at IPAMRequestSatisfied=False with every"
-                " Ingress in the cluster dead (#69). Reserve the pin in a pool whose"
-                f" serviceSelector matches {INGRESS_SERVICE}, and keep the general pool"
-                " clear of it.")
+                f"ingress pin {ip} is inside {label}, which {open_reason}. LB-IPAM can hand"
+                " that address to the next Service that asks for one, and will not evict it"
+                " to satisfy the pin -- cilium-ingress then sits at"
+                " IPAMRequestSatisfied=False with every Ingress in the cluster dead (#69)."
+                " Reserve the pin in a pool whose serviceSelector names"
+                f" {INGRESS_SERVICE} positively, and keep the general pool clear of it.")
         else:
             errors.append(
                 f"ingress pin {ip} is inside {label}, whose serviceSelector does not match"
