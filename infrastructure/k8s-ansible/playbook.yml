@@ -244,6 +244,66 @@
           Existing cluster already advertises {{ apiserver_advertise_address }}
       when: admin_conf.content is defined
 
+    # ── Ingress pin ───────────────────────────────────────
+    # The address the ingress gate waits for, ~800 lines down, read back out of the file
+    # the chart is rendered from rather than restated there -- the same argument as
+    # pod_cidr and apiserver_advertise_address above. A restated pin is a second place to
+    # edit, and the failure of forgetting is a play that certifies the wrong address.
+    #
+    # Resolved here rather than beside the gate, on the same argument the host-identity
+    # block makes and the same one that moved the deploy-key assert into pre_tasks: the
+    # gate cannot run until Cilium is installed, but the *shape* of the pin is settled by
+    # values.yaml alone and is therefore decidable now. Beside the gate, a pin this play
+    # cannot check cost a full bootstrap -- kubeadm init, the Helm install, the config
+    # apply -- before saying so. This is the last thing decidable without the machine;
+    # everything below it changes the host.
+    #
+    # `| default('')` where those two read their keys plainly, because this one is an
+    # annotation name: delete or misspell it and Kubernetes accepts the Service in silence,
+    # which is why check_deployments.sh calls that case out by name at its own pin lookup.
+    # Reading it plainly would end the play in a raw templating error naming a Jinja
+    # attribute; the empty string is caught by the assert below instead.
+    - name: Resolve the pinned ingress address
+      set_fact:
+        ingress_pin: >-
+          {{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips']
+             | default('') | trim }}
+
+    # lbipam.cilium.io/ips takes a comma-separated list, and check_deployments.sh supports
+    # it deliberately -- it validates every element and asserts each one lands inside a
+    # pool. The gate cannot make that claim, in either direction: compared whole, a list
+    # never equals one element, and .status.loadBalancer.ingress is a list whose order
+    # LB-IPAM does not promise, so picking `[0]` off the pin instead would be a coin flip.
+    # Checking a list properly means waiting for any address and then comparing the served
+    # set against the pinned set in a second task -- more machinery than the one address
+    # values.yaml has ever pinned is worth.
+    #
+    # So the limitation is stated here rather than discovered downstream. Without this, a
+    # two-address pin -- which CI passes and LB-IPAM serves correctly -- built the whole
+    # cluster, stalled 60s at the gate and then failed with a message blaming LB-IPAM for
+    # it, which is a worse failure than the one that gate exists to catch.
+    #
+    # The empty case is here for the same reason rather than for tidiness. It is not a
+    # vacuous pass -- kubectl rejects `--for=jsonpath={...}=` with nothing after the `=`,
+    # checked -- but it is rejected as a flag-syntax error, and the gate runs under
+    # `failed_when: false`, so that error arrives at the assert after it as "cilium-ingress
+    # is not serving " with the LB-IPAM diagnosis attached. A missing annotation would be
+    # reported as a broken cluster. Name it here, where the file and the key are in hand.
+    - name: Assert the chart pins exactly one ingress address
+      assert:
+        that:
+          - ingress_pin | length > 0
+          - "',' not in ingress_pin"
+        fail_msg: >-
+          the ingress gate at the end of this play compares one address against
+          .status.loadBalancer.ingress[0].ip, and lbipam.cilium.io/ips in the chart's
+          values.yaml is '{{ ingress_pin }}' -- absent, empty, or a comma-separated list.
+          An empty pin reaches kubectl as a malformed flag and would be reported there as a
+          cluster that is not serving; a list can never equal a single element of an
+          unordered status field. Pin one address, or extend that gate to wait for any
+          address and compare the served set with the pinned set.
+        success_msg: the chart pins the ingress at {{ ingress_pin }}
+
     # ── Swap ──────────────────────────────────────────────
     # swapoff -a is unconditional, so on its own it reports a change on every run for the
     # rest of the cluster's life -- long after `Remove swap from fstab` below made sure
@@ -1027,57 +1087,6 @@
       register: cilium_config
       changed_when: cilium_config.stdout_lines | reject('search', ' unchanged$') | list | length > 0
 
-    # The address the wait below demands, read back out of the file the chart was rendered
-    # from rather than restated here -- the same argument as pod_cidr and
-    # apiserver_advertise_address at the top of this play. A restated pin is a second place
-    # to edit, and the failure of forgetting is a play that certifies the wrong address.
-    #
-    # `| default('')` where those two read their keys plainly, because this one is an
-    # annotation name: delete or misspell it and Kubernetes accepts the Service in silence,
-    # which is why check_deployments.sh calls that case out by name at its own pin lookup.
-    # Reading it plainly would end the play in a raw templating error naming a Jinja
-    # attribute; the empty string is caught by the assert below instead.
-    - name: Resolve the pinned ingress address
-      set_fact:
-        ingress_pin: >-
-          {{ cilium_values.cilium.ingressController.service.annotations['lbipam.cilium.io/ips']
-             | default('') | trim }}
-
-    # lbipam.cilium.io/ips takes a comma-separated list, and check_deployments.sh supports
-    # it deliberately -- it validates every element and asserts each one lands inside a
-    # pool. The wait below cannot make that claim, in either direction: compared whole, a
-    # list never equals one element, and .status.loadBalancer.ingress is a list whose order
-    # LB-IPAM does not promise, so picking `[0]` off the pin instead would be a coin flip.
-    # Checking a list properly means waiting for any address and then comparing the served
-    # set against the pinned set in a second task -- more machinery than the one address
-    # values.yaml has ever pinned is worth.
-    #
-    # So the limitation is stated here rather than discovered downstream. Without this, a
-    # two-address pin -- which CI passes and LB-IPAM serves correctly -- stalls the play for
-    # 60s and then fails with a message blaming LB-IPAM for it, which is a worse failure
-    # than the one this gate exists to catch.
-    #
-    # The empty case is here for the same reason rather than for tidiness. It is not a
-    # vacuous pass -- kubectl rejects `--for=jsonpath={...}=` with nothing after the `=`,
-    # checked -- but it is rejected as a flag-syntax error, and the wait below runs under
-    # `failed_when: false`, so that error arrives at the assert after it as "cilium-ingress
-    # is not serving " with the LB-IPAM diagnosis attached. A missing annotation would be
-    # reported as a broken cluster. Name it here, where the file and the key are in hand.
-    - name: Assert the chart pins exactly one ingress address
-      assert:
-        that:
-          - ingress_pin | length > 0
-          - "',' not in ingress_pin"
-        fail_msg: >-
-          the gate below compares one address against
-          .status.loadBalancer.ingress[0].ip, and lbipam.cilium.io/ips in the chart's
-          values.yaml is '{{ ingress_pin }}' -- absent, empty, or a comma-separated list.
-          An empty pin reaches kubectl as a malformed flag and would be reported below as a
-          cluster that is not serving; a list can never equal a single element of an
-          unordered status field. Pin one address, or extend this gate to wait for any
-          address and compare the served set with the pinned set.
-        success_msg: the chart pins the ingress at {{ ingress_pin }}
-
     # check_deployments.sh asserts statically that the ingress pin sits inside the pool;
     # this is the cluster confirming it. When they disagree LB-IPAM sets
     # IPAMRequestSatisfied=False on cilium-ingress, the Service never gets an address and
@@ -1092,6 +1101,11 @@
     # the old lease stayed -- read as success and every ingress hostname resolved somewhere
     # else. `--for=jsonpath=<path>=<value>` is the same claim check_deployments.sh makes
     # statically, made against the live Service.
+    #
+    # ingress_pin comes from the Ingress pin block near the top of this play, which also
+    # asserts it is a single address -- the one shape this comparison can express. Reading
+    # it there rather than here is what keeps a pin this play cannot check from costing a
+    # whole bootstrap to find out.
     #
     # If the Service is missing entirely the wait errors rather than timing out -- that
     # means ingressController.enabled was turned off, which check_deployments.sh fails on
