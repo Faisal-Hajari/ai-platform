@@ -186,9 +186,16 @@
     # want on a multi-NIC box, and this check should not forbid it.
     #
     # Two consumers now: the asserts just below, and the LoadBalancer announcement check
-    # further down. One list suits both because the reject pattern is the same set Cilium
-    # itself refuses to auto-select devices from -- cilium_, lo, lxc, cni, docker -- so an
-    # interface dropped here is one it would never answer ARP on either.
+    # further down. One list suits both because this rejects very nearly what Cilium's own
+    # ExcludedDevicePrefixes holds -- cilium_, lo, lxc, cni, docker -- so an interface
+    # dropped here is one it would never answer ARP on either.
+    #
+    # Very nearly, not exactly: Cilium tests `lo` as a prefix and this anchors it `lo$`, so
+    # `lom1` and `loop0` survive here and would not there. The anchor is the right one for
+    # the assert below -- a NIC named `loop0` can perfectly well hold the address this host
+    # advertises on, and rejecting it would abort a legitimate config -- so the difference
+    # stays. It is one more way the announcement check's candidate set can come out wider
+    # than Cilium's; the paragraph in that checker lists the others.
     - name: Resolve the NICs that could carry the API server address
       set_fact:
         node_lan_nics: >-
@@ -361,11 +368,21 @@
           # task's own failure mode reached from the other side, and worse than not
           # checking, because it says so in prose.
           #
-          # An approximation of that selection and not a copy of it: Cilium also drops
-          # devices with no route, and cilium.devices in values.yaml (unset here) replaces
-          # the whole auto-detection. Both would make this refuse a pool the cluster would
-          # have announced -- wrong in the direction that fails loudly, which is the one
-          # this task can afford, and the failure names the interfaces it did consider.
+          # An approximation of that selection and not a copy of it, in three places.
+          # Cilium also drops devices with no route, and cilium.devices in values.yaml
+          # (unset here) replaces auto-detection outright; either would make this refuse a
+          # pool the cluster would have announced -- wrong in the direction that fails
+          # loudly, which is the one this task can afford, and the failure names the
+          # interfaces it did consider.
+          #
+          # The third diverges the other way and is not fixable from here. `enslaved` is
+          # built from the masters in this list, so a bridge the prefix filter already
+          # dropped -- cni0, docker0, kube-* -- contributes no ports, and a physical port
+          # enslaved to one stays a candidate although Cilium excludes it by MasterIndex.
+          # Ansible files nothing naming the master on the slave side (only
+          # perm_macaddress, and only for bonding slaves), so there is no fact to filter
+          # on; it also takes an enslaved port carrying its own address, which is unusual.
+          # Stated rather than closed.
           enslaved = set()
           for nic in nics:
               enslaved.update(nic.get("interfaces") or [])   # bridge ports
