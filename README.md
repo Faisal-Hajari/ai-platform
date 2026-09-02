@@ -115,8 +115,8 @@ editing these — nothing discovers them at run time.
 | API server address | [`system-apps/cilium/values.yaml`](infrastructure/k8s-ansible/system-apps/cilium/values.yaml) (`k8sServiceHost`) | Cilium's direct dial, **and** `kubeadm init --apiserver-advertise-address` — the playbook reads this key, so both are pinned to the one value |
 | Pod CIDR | same file (`ipam.operator.clusterPoolIPv4PodCIDRList`) | Cilium's allocator **and** `kubeadm init --pod-network-cidr`, same way. Rebuild-only; see the comment there |
 | Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Must sit inside the pool below |
-| LoadBalancer pool | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope |
-| NIC name (`eno1`) | [`system-apps/cilium/config/l2-policy.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses |
+| LoadBalancer pool | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope — and on the subnet the NIC below is attached to |
+| NIC name (`eno1`) | [`system-apps/cilium/config/l2-policy.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses. Its subnet is the one the pool has to sit on, and that subnet is a lease on the node, so no file here states it |
 | Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible, and the home the kubeconfig and the chart cache are written into |
 
 The API server address and the pod CIDR used to be written twice each — once for Cilium
@@ -127,6 +127,15 @@ it is still the address that cluster was built to advertise. The second one fire
 re-run that looks like it should be a no-op, which is exactly when it is least expected
 and most needed: see the paragraph below for why editing this value on a live cluster is
 only half a fix.
+
+The pool and the NIC are a pair in the same way, and a harder one to see, because nothing
+in the cluster reports it. LB-IPAM hands out pool addresses whatever the L2 policy says,
+so a pool on a subnet that NIC is not attached to — or a policy naming a NIC this host
+does not have, which applies without error — leaves every Ingress holding an
+`EXTERNAL-IP` that answers no ARP. Only the two files are in git; the subnet is not. So
+the check is split to match: `check_deployments.sh` asserts a policy exists and announces
+LoadBalancer addresses, and the playbook resolves the interfaces that policy matches on
+this host and refuses to build anything if the pool is off their subnets.
 
 **Give the node a DHCP reservation.** Its address is currently an ordinary lease
 (`ip route show default` → `proto dhcp`), and a moved lease is expensive here. Because
