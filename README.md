@@ -114,8 +114,8 @@ editing these — nothing discovers them at run time.
 |---|---|---|
 | API server address | [`system-apps/cilium/values.yaml`](infrastructure/k8s-ansible/system-apps/cilium/values.yaml) (`k8sServiceHost`) | Cilium's direct dial, **and** `kubeadm init --apiserver-advertise-address` — the playbook reads this key, so both are pinned to the one value |
 | Pod CIDR | same file (`ipam.operator.clusterPoolIPv4PodCIDRList`) | Cilium's allocator **and** `kubeadm init --pod-network-cidr`, same way. Rebuild-only; see the comment there |
-| Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Must sit inside the pool below |
-| LoadBalancer pool | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope — and on the subnet the NIC below is attached to |
+| Ingress address | same file (`lbipam.cilium.io/ips`) | the shared `cilium-ingress` LoadBalancer. Held by a pool reserved for that Service, and kept out of the general one |
+| LoadBalancer pools | [`system-apps/cilium/config/ip-pool.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/ip-pool.yaml) | LB-IPAM. A free range on the LAN, outside the DHCP scope — and on the subnet the NIC below is attached to. Split into the one address the ingress reserves and the general range everything else is allocated from |
 | NIC name (`eno1`) | [`system-apps/cilium/config/l2-policy.yaml`](infrastructure/k8s-ansible/system-apps/cilium/config/l2-policy.yaml) | L2 announcements — the interface that ARPs for pool addresses. Its subnet is the one the pool has to sit on, and that subnet is a lease on the node, so no file here states it |
 | Login user | [`infrastructure/k8s-ansible/inventory.ini`](infrastructure/k8s-ansible/inventory.ini) | Ansible, and the home the kubeconfig and the chart cache are written into |
 

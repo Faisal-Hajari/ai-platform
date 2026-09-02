@@ -76,13 +76,23 @@ cilium:
     service:
       annotations:
         # Pin the shared entrypoint so ingress hostnames have a stable A record.
-        # config/ip-pool.yaml names this range explicitly, so .200 is an address that
-        # file spells out rather than one it happens to cover -- keep the two in step;
-        # infrastructure/scripts/check_deployments.sh fails if they drift, and
-        # .github/workflows/check-deployments.yml runs it on every change here. The
-        # playbook applies both in one step now, so they can no longer disagree while
-        # two Applications sync in an arbitrary order -- but they can still be edited
-        # apart, which is what the check is for.
+        #
+        # config/ip-pool.yaml holds this address in a pool of its own, scoped by
+        # serviceSelector to this Service -- keep the two in step. Being inside a pool is
+        # not enough on its own: an address a general pool can hand out is an address
+        # LB-IPAM can give to the next Service that asks for one, and it will not evict
+        # that holder to satisfy this pin. The Service then sits at
+        # IPAMRequestSatisfied=False with every Ingress in the cluster dead, and it does
+        # not self-heal (#69). Moving the pin therefore means moving ingress-pool's block
+        # with it, and keeping local-pool clear of wherever it lands.
+        #
+        # infrastructure/scripts/check_deployments.sh asserts both halves -- covered by a
+        # pool that can serve this Service, covered by no pool that serves anything else --
+        # and .github/workflows/check-deployments.yml runs it on every change here. The
+        # playbook applies the chart and the pools in one step now, so they can no longer
+        # disagree while two Applications sync in an arbitrary order -- but they can still
+        # be edited apart, which is what the check is for.
+        #
         # LB-IPAM's own annotation, rather than spec.loadBalancerIP, which k8s
         # deprecated in 1.24.
         lbipam.cilium.io/ips: "192.168.100.200"

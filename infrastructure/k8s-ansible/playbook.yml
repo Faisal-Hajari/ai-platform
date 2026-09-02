@@ -487,8 +487,14 @@
                           first, last = network[0], network[-1]
                           label = "%s: %s (%s-%s)" % (name, block["cidr"], first, last)
                       else:
+                          # `stop` is optional to LB-IPAM: a block with a start and no
+                          # stop is the single address `start` (ipRangeFromBlock), which
+                          # is a reasonable way to write the one-address reservation in
+                          # config/ip-pool.yaml. Requiring it here would call a block the
+                          # cluster accepts malformed, and fail a correct pool.
                           first = ipaddress.ip_address(block["start"])
-                          last = ipaddress.ip_address(block["stop"])
+                          last = (ipaddress.ip_address(block["stop"])
+                                  if block.get("stop") else first)
                           label = "%s: %s-%s" % (name, first, last)
                   except (KeyError, TypeError, ValueError) as exc:
                       malformed.append("%s block %d (%s): %r" % (name, index, exc, block))
