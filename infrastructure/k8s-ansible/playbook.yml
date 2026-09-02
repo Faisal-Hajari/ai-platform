@@ -155,6 +155,27 @@
       set_fact:
         apiserver_advertise_address: "{{ cilium_values.cilium.k8sServiceHost }}"
 
+    # Every interface on this host, cut down to the three keys anything below reads.
+    # Two checks want it: the API server asserts want the LAN NICs, and the LoadBalancer
+    # announcement check further down wants all of them. The projection is also what
+    # makes handing the second one to a subprocess as JSON cheap -- the raw facts carry a
+    # `features` map of a few hundred keys per NIC.
+    #
+    # regex_replace before extract because the two spellings differ. `interfaces` holds
+    # device names as the kernel has them, while the per-interface fact is filed under
+    # that name with `-` replaced by `_` -- so a `br-lan` bridge is `ansible_facts.br_lan`
+    # and extracting by the raw name yields Undefined, which the filters below then fail
+    # on. `device` inside the fact is still the kernel name, so the interface matching
+    # further down sees the real thing.
+    - name: Resolve this host's interfaces and the IPv4 addresses on them
+      set_fact:
+        node_nics: >-
+          {{ ansible_facts['interfaces'] | map('regex_replace', '-', '_')
+             | map('extract', ansible_facts)
+             | map('dict2items')
+             | map('selectattr', 'key', 'in', ['device', 'ipv4', 'ipv4_secondaries'])
+             | map('items2dict') | list }}
+
     # Not ansible_all_ipv4_addresses: that includes cilium_host, whose /32 out of the pod
     # range is on this host and is useless as an advertise address -- accepting it would
     # wave through exactly the deadlock these asserts exist to prevent. Filter out the
@@ -164,9 +185,9 @@
     - name: Resolve the NICs that could carry the API server address
       set_fact:
         node_lan_nics: >-
-          {{ ansible_facts['interfaces']
-             | reject('search', '^(lo$|cilium_|lxc|cni|veth|docker|flannel|kube)')
-             | map('extract', ansible_facts) | list }}
+          {{ node_nics
+             | rejectattr('device', 'search', '^(lo$|cilium_|lxc|cni|veth|docker|flannel|kube)')
+             | list }}
 
     # Both ipv4 and ipv4_secondaries. Ansible files only the first non-secondary address
     # of an interface under `ipv4`; every later one goes to `ipv4_secondaries`. Reading
@@ -243,6 +264,219 @@
         success_msg: >-
           Existing cluster already advertises {{ apiserver_advertise_address }}
       when: admin_conf.content is defined
+
+    # ── LoadBalancer announcement ─────────────────────────
+    # config/ip-pool.yaml declares the addresses LB-IPAM hands out; config/l2-policy.yaml
+    # names the interface those addresses are announced on over ARP. The two only work
+    # together while the pool sits on the subnet that interface is attached to, and that
+    # subnet is the one half of the pair that is not in git: it is a DHCP lease on this
+    # host. So infrastructure/scripts/check_deployments.sh asserts everything about those
+    # two files that is visible from the files alone, and this asserts the rest, against
+    # the machine (#39).
+    #
+    # Worth a task because the cluster accepts the mismatch in silence. LB-IPAM still
+    # allocates and the Service still shows an EXTERNAL-IP; the policy still applies
+    # cleanly, because naming an interface this host does not have is not an error. No
+    # ARP responder ever answers, so `kubectl get svc` looks correct and nothing on the
+    # LAN can reach the address. The play's own "Wait for the ingress address to be
+    # served" gate does not see it either -- that address comes from LB-IPAM, which does
+    # not care whether anything announces it.
+    #
+    # Up here with the host-identity asserts, and for their reason: this needs only the
+    # repo and the machine, so a renumbered LAN should abort a pristine host rather than
+    # one that has already had swap disabled, kubeadm installed and a cluster built.
+    #
+    # Read on the controller, like the values file above, so the parsing happens where
+    # PyYAML is Ansible's own dependency rather than something the target has to have.
+    # *.yaml and *.yml both, because `kubectl apply -f config/` applies both spellings and
+    # reading only half of them would let a pool look homeless when it is not.
+    - name: Read the Cilium LoadBalancer configuration
+      set_fact:
+        cilium_config_docs: >-
+          {{ (cilium_config_docs | default([]))
+             + (lookup('file', item) | from_yaml_all | list) }}
+      loop: "{{ query('fileglob', cilium_chart_dir + '/config/*.yaml',
+                                  cilium_chart_dir + '/config/*.yml') | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    # `python3 -` with the program on stdin rather than a shell heredoc: the heredoc would
+    # become the task's `cmd`, so every failure would print the whole checker back at the
+    # operator ahead of the one paragraph that says what is wrong. Only the standard
+    # library is used, so this asks nothing of the target beyond the interpreter Ansible
+    # already needs there.
+    - name: Assert the LoadBalancer pool is on a subnet this host announces it on
+      command: python3 -
+      args:
+        stdin: |
+          import ipaddress, json, os, re, sys
+
+          docs = json.loads(os.environ["CILIUM_CONFIG"])
+          nics = json.loads(os.environ["NODE_NICS"])
+          config_dir = os.environ["CILIUM_CONFIG_DIR"]
+
+          # Which interfaces will answer ARP for a LoadBalancer address. spec.interfaces
+          # is a list of regular expressions matched unanchored -- Cilium compiles each
+          # with Go's regexp and asks MatchString, and re.search is that same question, so
+          # "eno1" also matches "veno10". Absent or empty means every interface, which is
+          # Cilium's default and is a widening, not a narrowing.
+          #
+          # spec.nodeSelector and spec.serviceSelector are deliberately not read. They
+          # decide *whether* a policy announces, not *where*; this asks only whether the
+          # pool is reachable if it announces at all, and a policy narrowed until it
+          # announces nothing is a different bug that this does not claim to catch.
+          announced = set()   # every interface some policy will answer on
+          announcers = 0
+          for doc in docs:
+              if not isinstance(doc, dict) or doc.get("kind") != "CiliumL2AnnouncementPolicy":
+                  continue
+              name = (doc.get("metadata") or {}).get("name") or "<unnamed>"
+              spec = doc.get("spec") or {}
+              # externalIPs alone announces Service.spec.externalIPs, which nothing here
+              # sets; it cannot make an LB-IPAM address reachable.
+              if not spec.get("loadBalancerIPs"):
+                  continue
+              announcers += 1
+              patterns = spec.get("interfaces") or []
+              # Checked for being a list before it is iterated. `interfaces: eno1` is
+              # rejected by the CRD schema but arrives here as a plain string, which
+              # iterates as "e", "n", "o", "1" -- four regexes that between them match
+              # nearly every interface, so the check would pass on config the cluster
+              # will not accept.
+              if not isinstance(patterns, list):
+                  print("%s: spec.interfaces is %r, which is not a list of regular"
+                        " expressions" % (name, patterns), file=sys.stderr)
+                  sys.exit(1)
+              try:
+                  matchers = [re.compile(p) for p in patterns]
+              except (re.error, TypeError) as exc:
+                  print("%s: spec.interfaces is not a list of regular expressions (%s)"
+                        % (name, exc), file=sys.stderr)
+                  sys.exit(1)
+              for nic in nics:
+                  device = nic.get("device")
+                  if device and (not matchers or any(m.search(device) for m in matchers)):
+                      announced.add(device)
+
+          # The subnets those interfaces are attached to. Both ipv4 and ipv4_secondaries,
+          # for the reason the API server assert above reads both: Ansible files only an
+          # interface's first address under ipv4 and every later one under
+          # ipv4_secondaries, and a pool on a static address added beside a DHCP lease is
+          # perfectly announceable.
+          subnets = []   # (label, network)
+          for device in sorted(announced):
+              nic = next(n for n in nics if n.get("device") == device)
+              entries = [nic["ipv4"]] if isinstance(nic.get("ipv4"), dict) else []
+              entries += [e for e in (nic.get("ipv4_secondaries") or []) if isinstance(e, dict)]
+              for entry in entries:
+                  address, netmask = entry.get("address"), entry.get("netmask")
+                  if not address or not netmask:
+                      continue
+                  # address/netmask rather than the `network` key beside them, because
+                  # ip_interface derives the network itself and so cannot be told a
+                  # network that disagrees with the mask.
+                  try:
+                      network = ipaddress.ip_interface("%s/%s" % (address, netmask)).network
+                  except ValueError:
+                      continue
+                  subnets.append(("%s %s" % (device, network), network))
+
+          # The addresses the pool can hand out. A simpler parse than the one in
+          # infrastructure/scripts/check_deployments.sh, and the difference is not an
+          # oversight: that check has to work out which pool can serve one particular
+          # Service, so it honours spec.serviceSelector and allowFirstLastIPs. The
+          # question here is which addresses could ever be announced, and both of those
+          # only ever shrink a block -- so checking the wider range is the safe direction
+          # and needs neither.
+          blocks = []
+          unread = []   # blocks this check is not equipped to read, kept for the message
+          for doc in docs:
+              if not isinstance(doc, dict) or doc.get("kind") != "CiliumLoadBalancerIPPool":
+                  continue
+              name = (doc.get("metadata") or {}).get("name") or "<unnamed>"
+              spec = doc.get("spec") or {}
+              if spec.get("disabled"):
+                  continue
+              for block in spec.get("blocks") or []:
+                  try:
+                      if "cidr" in block:
+                          # strict=False because that is what LB-IPAM does: it normalizes
+                          # a host address to its network, so "192.168.100.200/28" really
+                          # offers .192-.207 (#8) -- and .192 can be on a different subnet
+                          # than the .200 someone meant to write.
+                          network = ipaddress.ip_network(block["cidr"], strict=False)
+                          first, last = network[0], network[-1]
+                          label = "%s: %s (%s-%s)" % (name, block["cidr"], first, last)
+                      else:
+                          first = ipaddress.ip_address(block["start"])
+                          last = ipaddress.ip_address(block["stop"])
+                          label = "%s: %s-%s" % (name, first, last)
+                  except (KeyError, TypeError, ValueError):
+                      # A malformed block is check_deployments.sh's to report, with the
+                      # better message for it. Saying it again here only buries that one.
+                      continue
+                  # IPv4 only, because the facts this is handed are. An IPv6 block would
+                  # fail containment against a set of subnets that was never going to hold
+                  # it, and the message would be a confident lie about the network rather
+                  # than an admission of this check's reach.
+                  (blocks if first.version == 4 else unread).append((label, first, last))
+
+          if not blocks:
+              if unread:
+                  print("only IPv6 pool blocks under %s (%s), and this reads the host's"
+                        " IPv4 addresses -- nothing checked"
+                        % (config_dir, ", ".join(label for label, _, _ in unread)))
+                  sys.exit(0)
+              print("no usable CiliumLoadBalancerIPPool block found under %s, so nothing"
+                    " declares the addresses the ingress comes out of" % config_dir,
+                    file=sys.stderr)
+              sys.exit(1)
+
+          # Nothing announces at all. Naming each block as homeless below would be true and
+          # would bury the reason, and the pool is not the half to fix, so this is its own
+          # failure with its own remedy.
+          reason = None
+          if not announcers:
+              reason = ("no CiliumL2AnnouncementPolicy under %s sets loadBalancerIPs: true"
+                        % config_dir)
+          elif not announced:
+              reason = ("the policies under %s name interfaces that match nothing on this"
+                        " host, which has %s"
+                        % (config_dir,
+                           ", ".join(sorted(n["device"] for n in nics if n.get("device")))))
+          elif not subnets:
+              reason = ("the policies under %s announce on %s, and none of those holds an"
+                        " IPv4 address" % (config_dir, ", ".join(sorted(announced))))
+          if reason:
+              print("Nothing on this host will answer ARP for the LoadBalancer pool: %s."
+                    " LB-IPAM still allocates and the Service still shows an EXTERNAL-IP,"
+                    " so this fails silently in the cluster -- nothing on the LAN can reach"
+                    " the address. Fix spec.interfaces or spec.loadBalancerIPs in"
+                    " %s/l2-policy.yaml." % (reason, config_dir), file=sys.stderr)
+              sys.exit(1)
+
+          announced_on = "; ".join(label for label, _ in subnets)
+          homeless = [label for label, first, last in blocks
+                      if not any(first in net and last in net for _, net in subnets)]
+          if homeless:
+              print("LoadBalancer pool block %s is outside every subnet this host announces"
+                    " on (%s). LB-IPAM still allocates out of that block and the Service"
+                    " still shows an EXTERNAL-IP, so this fails silently in the cluster --"
+                    " no ARP responder ever answers for the address and nothing on the LAN"
+                    " can reach it. Either move the block onto one of those subnets in"
+                    " %s/ip-pool.yaml, or point spec.interfaces in %s/l2-policy.yaml at the"
+                    " NIC that is on the block's subnet."
+                    % ("; ".join(homeless), announced_on, config_dir, config_dir),
+                    file=sys.stderr)
+              sys.exit(1)
+
+          print("%s is announced on %s"
+                % (", ".join(label for label, _, _ in blocks), announced_on))
+      environment:
+        CILIUM_CONFIG: "{{ cilium_config_docs | to_json }}"
+        CILIUM_CONFIG_DIR: "{{ cilium_chart_dir }}/config"
+        NODE_NICS: "{{ node_nics | to_json }}"
+      changed_when: false
 
     # ── Ingress pin ───────────────────────────────────────
     # The address the ingress gate waits for, ~800 lines down, read back out of the file

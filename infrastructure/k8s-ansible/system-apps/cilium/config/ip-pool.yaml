@@ -23,5 +23,14 @@ spec:
     # on every change to this chart. That run going red is the warning that arrives
     # before the cluster's, which is IPAMRequestSatisfied=False and every Ingress dead --
     # a signal, not a merge gate, so do not sail past it.
+    #
+    # The other constraint on this range is the LAN it is on. config/l2-policy.yaml
+    # announces these addresses over ARP on one named interface, and they only reach
+    # anything while they sit on that interface's subnet -- 192.168.100.0/24, which is a
+    # DHCP lease on the node and is written down nowhere in this repo. No check here can
+    # see that, so infrastructure/k8s-ansible/playbook.yml asserts it against the host
+    # before it builds anything (#39). Moving this range to another subnet means moving
+    # the interface with it, and there is no cluster-side warning if you do not: LB-IPAM
+    # allocates happily out of a range nothing announces.
     - start: "192.168.100.200"
       stop: "192.168.100.215"
