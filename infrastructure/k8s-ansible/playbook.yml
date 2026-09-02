@@ -834,6 +834,7 @@
       file:
         path: /etc/containerd
         state: directory
+        mode: '0755'
 
     # kubelet is configured for the systemd cgroup driver, so containerd has to use it
     # too; a mismatch leaves both managing the same cgroups and the node gets unstable
@@ -858,8 +859,58 @@
       when: containerd_config_stat.stat.exists
       register: containerd_config
 
+    # Written through a temporary file for the same reason the apt key above is, and to
+    # protect the same config the slurp above refuses to guess at. `containerd config
+    # default > /etc/containerd/config.toml` truncates the target *before* containerd
+    # runs, so anything that makes the command fail -- the binary missing or mid-upgrade,
+    # a plugin the installed version cannot render, a full disk -- empties a config this
+    # task only ever runs against because it holds settings and no SystemdCgroup line:
+    # a hand-rolled or upgrade-carried config with a registry mirror, a proxy or a
+    # sandbox_image in it. The assert below does catch the empty file, but the original is
+    # already gone by then, and re-running does not bring it back -- the next run reads an
+    # empty config, sees no SystemdCgroup, and regenerates over it again. `set -o pipefail`
+    # would not have helped: the truncation is the redirect's, not the command's.
+    #
+    # mktemp -p /etc/containerd puts the temp file on the target's filesystem, so the mv
+    # is a rename and the config is never briefly half-written; the trap clears it on
+    # every failure path.
+    #
+    # The two checks before the mv are what make the temp file worth having, and they are
+    # the ones a non-zero exit does not cover: a command that exits 0 having written
+    # nothing, and one that exits 0 having written something without the key this whole
+    # block exists to set -- a future default layout that renames it, say. Both would
+    # otherwise land as an assert failure 30 lines below, over a config that had already
+    # been replaced by the thing that failed it.
+    #
+    # Each carries its own message because a bare `[ -s ]` or `grep -q` failing under -e
+    # gives the operator `rc: 1` with empty stdout and empty stderr and the whole script
+    # echoed back -- strictly less than the assert it displaces, which at least has a
+    # fail_msg. The messages are also what keeps `-s` worth its line: `grep -q` returns 1
+    # on an empty file too, so it already covers that case, and the only thing `-s` adds
+    # is telling the two apart. They point at different problems -- a containerd that
+    # produced nothing at all, versus one whose output this play no longer understands --
+    # so it is worth saying which happened.
     - name: Generate default containerd config
-      shell: containerd config default > /etc/containerd/config.toml
+      shell: |
+        set -euo pipefail
+        tmp=$(mktemp -p /etc/containerd config.toml.XXXXXX)
+        trap 'rm -f "$tmp"' EXIT
+        containerd config default > "$tmp"
+        [ -s "$tmp" ] || {
+          echo "containerd config default exited 0 and wrote nothing;" \
+               "leaving /etc/containerd/config.toml alone" >&2
+          exit 1
+        }
+        grep -q SystemdCgroup "$tmp" || {
+          echo "containerd config default produced no SystemdCgroup key;" \
+               "leaving /etc/containerd/config.toml alone" >&2
+          exit 1
+        }
+        chmod 0644 "$tmp"
+        mv "$tmp" /etc/containerd/config.toml
+        trap - EXIT
+      args:
+        executable: /bin/bash
       when: "'SystemdCgroup' not in (containerd_config.content | default('') | b64decode)"
       notify: restart containerd
 
