@@ -43,6 +43,8 @@ system-apps/
       ip-pool.yaml    CiliumLoadBalancerIPPool
       l2-policy.yaml  CiliumL2AnnouncementPolicy
   argocd/
+    Chart.yaml        umbrella over the upstream argo-cd chart, version pinned
+    values.yaml       ArgoCD's own configuration
     applicationset.yaml
 ```
 
@@ -98,13 +100,26 @@ The order the play uses is load-bearing and worth knowing before editing it:
    in the cluster dead — with no reconciler behind the play, a run that went green here
    would be the last thing to notice.
 
-**ArgoCD's directory holds `applicationset.yaml` alone.** ArgoCD installs from a pinned
-upstream URL (`v3.3.11`, in `../playbook.yml`) and that 20k-line manifest is not worth
-vendoring. This leaves the two entries uneven — one is a chart plus values, the other a
-URL plus a manifest. Moving ArgoCD to its Helm chart with a pinned version and a
-`values.yaml` would make every entry the same shape and finally give ArgoCD's own
-configuration a home in git; it is the better end state and a larger change than this
-one, so it is deliberately left as a follow-up. Tracked as #50.
+**Both entries are the same shape**: a chart with a pinned version and a `values.yaml`.
+ArgoCD used to install from a pinned `raw.githubusercontent.com` URL (`v3.3.11`) held as a
+literal in `../playbook.yml`, which left it uneven with Cilium and cost three things.
+There was nowhere to put an ArgoCD setting, so RBAC, SSO and repo-server tuning all meant
+patching a live cluster with nothing in git. `../../scripts/check_deployments.sh` globs
+`system-apps/*/Chart.yaml`, so a directory without one was never rendered or checked. And
+the version sat where no tooling could read it. `argocd/Chart.yaml` fixes all three.
+
+The chart's version and ArgoCD's are different numbers: `argo-cd` 10.6.4 ships ArgoCD
+v3.5.2, and no chart in that repository ever shipped v3.3.11 — argo-helm's 3.3 line stops
+at appVersion v3.3.9 while upstream ArgoCD went on past it. The move therefore could not
+carry the old pin across, and taking the current chart was the only option that did not
+also mean adopting a chart line that receives no further releases.
+
+`applicationset.yaml` stays a plain manifest beside the chart rather than becoming a
+template inside it. The play reads it with `lookup('file')` in `pre_tasks` and asserts on
+its parsed contents *before* the bootstrap runs, which is what makes a bad repo URL fail
+in the first ten seconds rather than 400 lines in; a Helm template is not YAML until it is
+rendered, and rendering it would need the chart, the node and a cluster to install into.
+Helm ignores files outside `templates/`, so it sits there inertly.
 
 ## Accepted trade-offs
 
@@ -166,3 +181,13 @@ resources that carry no `meta.helm.sh/release-name` ownership metadata. Sequenci
 migration as `infrastructure/scripts/destroy_cluster.sh --keep-packages` plus a rebuild
 sidesteps both questions and exercises the new bootstrap path, which needs testing
 regardless.
+
+**ArgoCD has the same problem and no equivalent escape hatch.** On a cluster built before
+it moved to the chart, every ArgoCD object was created by `kubectl apply` and carries no
+Helm ownership metadata, so the first `helm upgrade --install argocd` fails on ownership
+rather than adopting them. Annotating them by hand is not the fix — there are hundreds of
+objects, and getting one wrong leaves a release Helm believes owns something it does not.
+Take the same rebuild path; the play asserts on this and says so when the install fails.
+Note also that the chart's CRDs carry `helm.sh/resource-policy: keep`, so `helm uninstall
+argocd` on its own leaves `applications.argoproj.io` and its siblings behind — along with
+every Application stored in them.

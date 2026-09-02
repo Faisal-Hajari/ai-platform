@@ -1,0 +1,52 @@
+# ArgoCD's configuration. Until #50 there was nowhere to put a setting: the play applied
+# a pinned upstream manifest with `kubectl apply`, so RBAC, SSO, resource tracking and
+# repo-server tuning all meant patching a live cluster by hand, with nothing in git and
+# nothing to re-apply on the next rebuild. This is that home.
+#
+# Every setting has to be nested under `argo-cd` -- the *dependency's* name in Chart.yaml,
+# hyphen and all, not the umbrella's `argocd`. A top-level key that matches no dependency
+# is not an error to Helm, it is silently ignored and the upstream default applies
+# instead. ../../../scripts/check_deployments.sh fails the build on that mistake; it is
+# the same rule, and the same check, as cilium/values.yaml.
+#
+# Nothing is overridden today. That is deliberate rather than unfinished: the move to the
+# chart was meant to keep the cluster's behaviour as it was, so anything set here would
+# have been a second change hiding inside the first. The notes below are the settings
+# most likely to be wanted next, and what each one costs.
+
+# argo-cd:
+#
+#   REBUILD-ONLY, and the reason the whole migration wants a rebuild. Helm refuses to
+#   adopt resources that carry no meta.helm.sh/release-name metadata, and every ArgoCD
+#   object on a cluster built before #50 was created by `kubectl apply` and carries none.
+#   See ../README.md's migration section: destroy_cluster.sh --keep-packages plus a
+#   rebuild, not an in-place adoption.
+#
+#   DO NOT SET nameOverride or fullnameOverride. Both rename every workload, and
+#   "Wait for ArgoCD to be ready" in ../../playbook.yml waits on four Deployments by
+#   literal name -- argocd-server, argocd-repo-server, argocd-applicationset-controller
+#   and argocd-redis. Those names come out right only because the release is named
+#   `argocd`; renaming either end breaks the wait with a bare NotFound, which reads as a
+#   broken cluster rather than as a renamed object. The release name is in the playbook,
+#   beside the same warning.
+#
+#   Metrics Services are off by default in this chart and were present in the manifest it
+#   replaces: upstream install.yaml shipped argocd-metrics, argocd-server-metrics and
+#   argocd-notifications-controller-metrics, and the chart renders them only under
+#   `controller.metrics.enabled`, `server.metrics.enabled` and
+#   `notifications.metrics.enabled`. Nothing scrapes them today -- there is no Prometheus
+#   in this cluster and monitoring belongs in deployment/ by the membership rule in
+#   ../README.md -- so they are left off rather than carried forward as three Services
+#   with no consumer. Whoever deploys monitoring turns them on here.
+#
+#   The ApplicationSet controller gets a namespaced Role here where install.yaml also
+#   gave it a ClusterRole. That is not a regression: the ClusterRole exists for the
+#   "ApplicationSet in any namespace" feature, which the chart gates behind
+#   `applicationSet.allowAnyNamespace` (false). argocd/applicationset.yaml lives in the
+#   argocd namespace and templates Applications into it, so the namespaced Role covers
+#   everything it does. Setting allowAnyNamespace would be a real widening of what the
+#   controller can reach; do not set it to fix an unrelated permission error.
+#
+#   server.insecure is #47's. It belongs here rather than in a hand patch -- that is the
+#   point of this file -- but it is that issue's change to make and to justify, not a
+#   default to slip in with the migration.

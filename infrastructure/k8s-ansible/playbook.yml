@@ -39,6 +39,7 @@
     # callers who remembered to; deriving it removes the question.
     system_apps_dir: "{{ playbook_dir }}/system-apps"
     cilium_chart_dir: "{{ system_apps_dir }}/cilium"
+    argocd_chart_dir: "{{ system_apps_dir }}/argocd"
     # Ours to name -- nothing outside this play refers to it. ArgoCD finds it by label and
     # pairs it to a repository by URL, not by name.
     argocd_repo_secret_name: repo-ai-platform
@@ -1529,36 +1530,78 @@
       register: argocd_ns
       failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
 
-    # --server-side, but deliberately not --force-conflicts. The manifest is re-applied
-    # on every run, so --force-conflicts is not a one-off override: it standingly takes
-    # ownership of any field another manager has set since -- an operator, a hand patch,
-    # a chart layered on top -- and reverts it silently on the next run. A conflict is
-    # the useful signal that something outside this playbook is managing part of ArgoCD,
-    # so let it stop the run and be resolved deliberately. The field manager is left at
-    # kubectl's default so this keeps ownership of the fields the earlier forced applies
-    # already claimed.
-    - name: Install ArgoCD
-      command: >
-        kubectl apply -n argocd --server-side
-        -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.3.11/manifests/install.yaml
+    # The chart is an umbrella over the upstream argo-cd chart, so charts/ and Chart.lock
+    # are gitignored here exactly as they are for Cilium and the dependency has to be
+    # fetched on the node before anything can render. Same cache gate, same reasoning:
+    # keyed on the exact name-version.tgz Chart.yaml declares, so bumping the pin resolves
+    # again while a re-run that changes nothing does not need argoproj.github.io reachable.
+    - name: Read the ArgoCD chart's declared dependencies
+      set_fact:
+        argocd_chart: "{{ lookup('file', argocd_chart_dir + '/Chart.yaml') | from_yaml }}"
+
+    - name: Check whether the ArgoCD chart's dependencies are already cached
+      stat:
+        path: "{{ argocd_chart_dir }}/charts/{{ item.name }}-{{ item.version }}.tgz"
+      loop: "{{ argocd_chart.dependencies | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}-{{ item.version }}"
+      become: false
+      register: argocd_deps_cached
+
+    - name: Resolve the ArgoCD chart's dependencies
+      command: helm dependency update {{ argocd_chart_dir }}
+      become: false
+      when: argocd_deps_cached.results | rejectattr('stat.exists') | list | length > 0
+
+    # Was `kubectl apply --server-side` of a pinned install.yaml URL until #50. The pin now
+    # lives in the chart beside Cilium's, and ArgoCD's own configuration has a values.yaml
+    # to live in; check_deployments.sh renders this chart on every CI run, which it could
+    # not do while the directory held no Chart.yaml.
+    #
+    # The release name is load-bearing and is not free to change. Named `argocd`, the
+    # subchart's fullname template yields argocd-server, argocd-repo-server,
+    # argocd-applicationset-controller and argocd-redis -- the same names install.yaml
+    # used, and the literal names the rollout wait below asks about. Any other release
+    # name prefixes all of them (argocd-argo-cd-server, from a release called `argo`) and
+    # that wait fails with a bare NotFound. values.yaml carries the matching warning about
+    # nameOverride/fullnameOverride, which do the same damage from the other end.
+    #
+    # No -f: values.yaml sits inside the chart, so it is already the chart's defaults --
+    # the same file, read the same way, as `helm template` in check_deployments.sh.
+    #
+    # Not --wait, for the reason the Cilium install is not: what --wait would be paid for
+    # is the datapath being up, and that is waited on explicitly below, by name. --timeout
+    # IS meaningful here though, where the comment on the Cilium install says it would not
+    # be: this chart renders a pre-install/pre-upgrade hook Job (argocd-redis-secret-init),
+    # and helm blocks on hook completion whether or not --wait is given. The default bound
+    # is 5m, and that Job pulls quay.io/argoproj/argocd cold on a first bootstrap, so it
+    # is raised rather than left to be discovered as a flaky bootstrap.
+    - name: Install or upgrade ArgoCD
+      command: >-
+        helm upgrade --install argocd {{ argocd_chart_dir }}
+        --namespace argocd --timeout 10m
       environment:
         KUBECONFIG: /home/{{ ansible_user }}/.kube/config
       become: false
       register: argocd_install
       failed_when: false
 
-    # Deferred to an assert so the failure this play now allows arrives with the reason
-    # attached, instead of a raw server-side-apply conflict dump from kubectl.
-    - name: Assert the ArgoCD apply succeeded
+    # Deferred to an assert so the failure arrives with the reason attached. The conflict
+    # this used to explain was server-side apply's; Helm's is ownership metadata, and the
+    # resolution is not the same -- hence a different message rather than the old one
+    # reworded.
+    - name: Assert the ArgoCD install succeeded
       assert:
         that: argocd_install.rc == 0
         fail_msg: >-
-          kubectl apply failed for ArgoCD. If it reported a conflict, a field manager
-          other than kubectl owns part of the pinned manifest -- something outside this
-          playbook is managing ArgoCD. Settle that deliberately (take the field back, or
-          stop managing it elsewhere); re-adding --force-conflicts would only revert it
-          silently on every run. kubectl said: {{ argocd_install.stderr | default('') | trim }}
-        success_msg: ArgoCD applied with no field-ownership conflicts
+          helm upgrade --install failed for ArgoCD. If it reported invalid ownership
+          metadata or a missing meta.helm.sh/release-name annotation, this cluster's
+          ArgoCD predates the move to the chart: every object was created by `kubectl
+          apply` and carries no Helm ownership, and Helm will not adopt those. Do not
+          annotate them by hand -- run infrastructure/scripts/destroy_cluster.sh
+          --keep-packages and rebuild, which is the path system-apps/README.md nominates
+          for exactly this. helm said: {{ argocd_install.stderr | default('') | trim }}
+        success_msg: ArgoCD installed from the pinned chart
 
     # argocd-server is not what the gate at the end of this section asks about: the
     # applicationset controller has to reconcile the ApplicationSet and repo-server does the

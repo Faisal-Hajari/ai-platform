@@ -6,7 +6,7 @@
 # Two halves, rendered identically because `helm template` is what both deployers do:
 # infrastructure/k8s-ansible/system-apps/*/ is applied by the Ansible play (see
 # system-apps/README.md), and deployment/*/*/ is synced by ArgoCD. deployment/ is empty
-# today and that is not a failure -- the charts array below simply has one entry.
+# today and that is not a failure -- the charts array below simply matches nothing there.
 #
 # Note that `helm dependency update` writes into the chart's charts/ directory and
 # never prunes it. charts/ and Chart.lock are gitignored, so a stale copy left over
@@ -31,9 +31,13 @@ cilium_dir=infrastructure/k8s-ansible/system-apps/cilium
 # Without nullglob an empty deployment/ hands the unexpanded pattern to helm, and the
 # run ends on helm's complaint about a directory named `*` -- an error that says nothing
 # about the invariants that went unchecked. Both patterns are globs for that reason,
-# including the system-apps one, which today matches only $cilium_dir: a chart that has
-# gone missing should reach the cross-file check below, which says what it was needed
-# for, rather than take the run down on a helm error first.
+# including the system-apps one, which matches $cilium_dir and the argocd chart: a chart
+# that has gone missing should reach the cross-file check below, which says what it was
+# needed for, rather than take the run down on a helm error first.
+#
+# ArgoCD only reaches this loop at all because it is a chart now. While it installed from
+# a pinned upstream URL its directory held no Chart.yaml, so nothing here rendered it and
+# a broken value in it would have been found by a bootstrap rather than by CI.
 #
 # There is no "no charts found" failure any more either. deployment/ matching nothing is
 # the normal state now that the CNI has moved out of it, and it stops being a failure
