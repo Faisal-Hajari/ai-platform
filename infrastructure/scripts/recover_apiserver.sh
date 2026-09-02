@@ -33,7 +33,35 @@ command -v crictl >/dev/null || { echo "crictl not found -- see README.md"; exit
 
 # Every container object by this name, running or not: the live one and the orphan that
 # holds the reservation.
-IDS=$(crictl ps -a --name "^${NAME}$" -q)
+#
+# Guarded (#58): the bare assignment adopted crictl's status under `set -e`, so a crictl
+# that cannot reach containerd ended the script with nothing of its own to say -- crictl's
+# error reached the terminal, but nothing named the step or said that nothing had been
+# removed. It must not become `|| true` either: an empty IDS is the "nothing to do" exit 0
+# four lines below, so swallowing the error would turn "I could not look" into a clean bill
+# of health on a node that is wedged.
+#
+# crictl's stderr stays on the terminal rather than being folded into IDS with `2>&1`, and
+# on a node this repo builds that is not a hypothetical. The play installs the pinned binary
+# and nothing else -- "The tarball holds the binary alone", playbook.yml's own comment -- and
+# writes no /etc/crictl.yaml, so crictl falls back to its deprecated default-endpoint list
+# and says so on every successful call:
+#
+#   time="..." level=warning msg="runtime connect using default endpoints: [...]. As the
+#   default settings are now deprecated, you should set the endpoint instead."
+#
+# plus a `level=error` line per endpoint it then fails to dial. Inside the substitution any
+# of that would be counted as a container ID by the `wc -l` test below, so a one-container
+# node would look like two and this script would start removing a healthy API server.
+#
+# A /etc/crictl.yaml silences the warning, but nothing in this repo creates one and
+# destroy_cluster.sh does not remove one, so a machine that has it acquired it out of band --
+# which is exactly how an earlier version of this comment came to claim the play writes it.
+IDS=$(crictl ps -a --name "^${NAME}$" -q) || {
+  echo "crictl could not list containers (its error is above) -- is containerd running?" >&2
+  echo "Nothing has been removed." >&2
+  exit 1
+}
 
 if [ -z "$IDS" ]; then
   echo "No containers found named ${NAME}; nothing to do."
