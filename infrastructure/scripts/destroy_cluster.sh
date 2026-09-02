@@ -376,8 +376,9 @@ if installed containerd; then
   apt_unreadable="cannot ask apt what depends on containerd, so whether purging it would
     take another runtime's dependency with it is unknown -- and this script does not guess
     in that direction. Nothing has been purged; the cluster and its state directories are
-    already gone. Fix apt (a held dpkg lock clears on its own, \`sudo apt-get update\`
-    names a broken source) and re-run -- this script is idempotent."
+    already gone. \`sudo apt-get update\` names a broken source, and \`apt-cache rdepends\`
+    exits 100 on a package apt no longer knows -- which is what an installed containerd from
+    a since-removed repo looks like. Fix that and re-run -- this script is idempotent."
   provides=$(apt-cache showpkg containerd 2>/dev/null \
     | sed -n '/Reverse Provides:/,$p' | awk 'NR > 1 && NF { print $1 }' | sort -u) \
     || die "$apt_unreadable"
@@ -429,24 +430,30 @@ fi
 #   $ bash -c 'set -euo pipefail; x=$(false); echo REACHED'; echo "rc=$?"
 #   rc=1                                    # REACHED is not printed
 #
-# Under `pipefail` any apt-get failure -- the dpkg lock held by unattended-upgrades, a
-# half-configured package from the purge above, a broken source -- ended the run on this
-# line. That is #24's shape past the point a preflight can help: the packages are already
-# gone, and containerd's state, /opt/cni, the apt source, the binaries, the host tuning,
-# the swap restore and the verification block all sit below it. An advisory hint does not
-# get to end a teardown, and this one ended it without even printing why.
+# Under `pipefail` an apt-get that exits non-zero -- a source with no Release file, a
+# half-configured package from the purge above -- ended the run on this line. NOT the dpkg
+# lock, which is the obvious guess and is wrong here: the preflight refuses to run as root,
+# and unprivileged `apt-get -s` says so itself -- "Keep also in mind that locking is
+# deactivated".
 #
-# The `|| true` is inside the pipeline rather than after the substitution, which is the
-# obvious form and is wrong: awk's END block runs either way, so the failing path prints
-# its own 0 and then echo's, and `orphans` becomes two lines that `[` refuses --
+# That is #24's shape past the point a preflight can help: the packages are already gone,
+# and containerd's state, /opt/cni, the apt source, the binaries, the host tuning, the swap
+# restore and the verification block all sit below it. An advisory hint does not get to end
+# a teardown, and this one ended it without a word of its own.
+#
+# The `|| true` sits next to the command that can fail. Note which position is the broken
+# one: inside the *substitution*, at the end of the pipeline, awk's END block has already
+# run and printed its own 0, so `orphans` comes back as two lines that `[` refuses --
 #
 #   $ orphans=$(false | awk '/^Remv /{n++} END{print n+0}' || echo 0)
 #   $ [ "$orphans" -gt 0 ]
 #   bash: [: 0
 #   0: integer expected
 #
-# -- which reports "0 orphaned" on stdout and a bash error on stderr, i.e. the hint is
-# wrong in exactly the runs it was guarded for.
+# -- reporting "0 orphaned" on stdout and a bash error on stderr, i.e. wrong in exactly the
+# runs it was added for. `...) || echo 0`, genuinely *after* the substitution, does work:
+# awk's 0 is already in the variable and the echo only litters stdout with a stray 0. So
+# #58's literal suggestion is untidy rather than broken; this form is neither.
 orphans=$( { apt-get -s autoremove 2>/dev/null || true; } \
            | awk '/^Remv /{n++} END{print n+0}' )
 if [ "$orphans" -gt 0 ]; then

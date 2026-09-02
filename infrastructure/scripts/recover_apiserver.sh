@@ -35,12 +35,17 @@ command -v crictl >/dev/null || { echo "crictl not found -- see README.md"; exit
 # holds the reservation.
 #
 # Guarded (#58): the bare assignment adopted crictl's status under `set -e`, so a crictl
-# that cannot reach containerd ended the script with no message. It must not become
-# `|| true` either -- an empty IDS is the "nothing to do" exit 0 four lines below, so
-# swallowing the error would turn "I could not look" into a clean bill of health on a node
-# that is wedged. crictl's stderr is deliberately left on the terminal rather than folded
-# into IDS: it prints endpoint warnings on successful runs too, and those would be counted
-# as container IDs by the `wc -l` test below.
+# that cannot reach containerd ended the script with nothing of its own to say -- crictl's
+# error reached the terminal, but nothing named the step or said that nothing had been
+# removed. It must not become `|| true` either: an empty IDS is the "nothing to do" exit 0
+# four lines below, so swallowing the error would turn "I could not look" into a clean bill
+# of health on a node that is wedged.
+#
+# crictl's stderr stays on the terminal rather than being folded into IDS with `2>&1`. It
+# is not quiet -- a `level=error` line per endpoint it fails to dial, and a deprecation
+# warning on every run when /etc/crictl.yaml is missing (the playbook writes one, so not on
+# a node this script is meant for) -- and any of it inside the substitution would be
+# counted as a container ID by the `wc -l` test below.
 IDS=$(crictl ps -a --name "^${NAME}$" -q) || {
   echo "crictl could not list containers (its error is above) -- is containerd running?" >&2
   echo "Nothing has been removed." >&2
