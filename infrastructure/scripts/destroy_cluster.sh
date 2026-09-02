@@ -373,12 +373,15 @@ if installed containerd; then
   # A `|| true` would leave both variables empty, which reads as "nothing depends on
   # containerd" and purges it, taking Docker's runtime with it. The hint below may fail
   # towards silence; this may not fail towards purging, so it fails towards `die`.
-  apt_unreadable="cannot ask apt what depends on containerd, so whether purging it would
+  # Opens with what failed rather than with apt, because the pipeline includes `sudo`: a
+  # lapsed credential lands here too, and the preflight's `sudo -v` is what covers that.
+  apt_unreadable="could not read apt's dependency data, so whether purging containerd would
     take another runtime's dependency with it is unknown -- and this script does not guess
     in that direction. Nothing has been purged; the cluster and its state directories are
-    already gone. \`sudo apt-get update\` names a broken source, and \`apt-cache rdepends\`
-    exits 100 on a package apt no longer knows -- which is what an installed containerd from
-    a since-removed repo looks like. Fix that and re-run -- this script is idempotent."
+    already gone. \`sudo apt-get update\` names a sources file apt cannot parse, and
+    \`apt-cache rdepends\` exits 100 on a package apt no longer knows -- which is what an
+    installed containerd from a since-removed repo looks like. Fix that and re-run -- this
+    script is idempotent."
   provides=$(apt-cache showpkg containerd 2>/dev/null \
     | sed -n '/Reverse Provides:/,$p' | awk 'NR > 1 && NF { print $1 }' | sort -u) \
     || die "$apt_unreadable"
@@ -430,10 +433,16 @@ fi
 #   $ bash -c 'set -euo pipefail; x=$(false); echo REACHED'; echo "rc=$?"
 #   rc=1                                    # REACHED is not printed
 #
-# Under `pipefail` an apt-get that exits non-zero -- a source with no Release file, a
-# half-configured package from the purge above -- ended the run on this line. NOT the dpkg
-# lock, which is the obvious guess and is wrong here: the preflight refuses to run as root,
-# and unprivileged `apt-get -s` says so itself -- "Keep also in mind that locking is
+# Under `pipefail` an apt-get that exits non-zero ended the run on this line. What does that
+# is a sources file apt cannot *parse* -- measured, each returning 100: a malformed one-line
+# entry, and a deb822 stanza missing Types or Suites/Components. A source apt merely cannot
+# *fetch* returns 0, so "no Release file" is the wrong guess (an earlier version of this
+# comment said exactly that): a dead URI, a file: repo that is not there and an unknown
+# option all exit 0 on both this command and the apt-cache reads above. Not hypothetical
+# here -- the play writes kubernetes.list and the step below removes it.
+#
+# Also NOT the dpkg lock, which is the other obvious guess: the preflight refuses to run as
+# root, and unprivileged `apt-get -s` says so itself -- "Keep also in mind that locking is
 # deactivated".
 #
 # That is #24's shape past the point a preflight can help: the packages are already gone,

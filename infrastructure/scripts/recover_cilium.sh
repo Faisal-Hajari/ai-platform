@@ -37,13 +37,17 @@ set -euo pipefail
 #
 # One anchored match covers all four and refuses anything else rather than mangling it,
 # which is the right direction for a value whose only use is being written into two
-# workloads. A bracketed IPv6 literal is accepted and unwrapped -- the env var takes an
-# address, not a URL authority.
+# workloads. A bracketed IPv6 literal is accepted and unwrapped -- the vendored chart passes
+# k8sServiceHost through verbatim, and client-go's InClusterConfig re-brackets it through
+# net.JoinHostPort, so the env var takes an address and a bracketed one would double up.
+# `_` is in the host class only to keep the breadth the old parse had: it is invalid in a DNS
+# hostname and kubeadm writes an address, but newly refusing it would be a regression rather
+# than the fix this is.
 API=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') || {
   echo "cannot read the API server address from the kubeconfig (kubectl's error is above)." >&2
   exit 1
 }
-if [[ ! "$API" =~ ^https://([0-9A-Za-z.-]+|\[[0-9A-Fa-f:]+\]):([0-9]+)$ ]]; then
+if [[ ! "$API" =~ ^https://([0-9A-Za-z._-]+|\[[0-9A-Fa-f:]+\]):([0-9]+)$ ]]; then
   echo "the current context names no usable API server address (got '${API:-<empty>}')." >&2
   echo "Expected https://<host>:<port>. Check \`kubectl config current-context\` --" >&2
   echo "Cilium cannot be pointed at nothing, and will not be pointed at a guess." >&2
