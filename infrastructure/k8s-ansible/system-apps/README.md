@@ -94,7 +94,7 @@ vendoring. This leaves the two entries uneven — one is a chart plus values, th
 URL plus a manifest. Moving ArgoCD to its Helm chart with a pinned version and a
 `values.yaml` would make every entry the same shape and finally give ArgoCD's own
 configuration a home in git; it is the better end state and a larger change than this
-one, so it is deliberately left as a follow-up.
+one, so it is deliberately left as a follow-up. Tracked as #50.
 
 ## Accepted trade-offs
 
