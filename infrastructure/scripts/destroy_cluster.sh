@@ -242,6 +242,24 @@ if [ -d /etc/containerd/conf.d ]; then
   info "cleared NVIDIA containerd drop-ins"
 fi
 
+# The CDI specs the device plugin generates, which is how a GPU actually reaches a pod here:
+# containerd 2.x has CDI on by default and the plugin runs with
+# DEVICE_LIST_STRATEGY=cdi-annotations,cdi-cri, so the runtime handler is never on the path
+# for an ordinary GPU workload -- the spec in /run/cdi is. It names device nodes and the
+# hook under /usr/local/nvidia that the step below deletes, so leaving it behind leaves a
+# spec pointing at a hook that is gone.
+#
+# /run is a tmpfs and so this self-clears on reboot, and a rebuild regenerates the spec
+# regardless. It goes anyway: a teardown that has to be followed by a reboot to be complete
+# is not the claim this script makes. Matched on the nvidia-specific filenames rather than
+# clearing the directory, because CDI is a general mechanism and another vendor's spec is
+# not ours to delete.
+for cdi_dir in /var/run/cdi /etc/cdi; do
+  [ -d "$cdi_dir" ] || continue
+  sudo find "$cdi_dir" -maxdepth 1 -name '*nvidia*' -delete 2>/dev/null || true
+done
+info "cleared NVIDIA CDI specs"
+
 # /run/nvidia is a tmpfs-backed runtime directory that also carries the driver-root bind
 # mount the Operator sets up; /usr/local/nvidia is the toolkit install dir (toolkit.installDir
 # in system-apps/gpu-operator/values.yaml). Neither belongs to the host driver, which lives

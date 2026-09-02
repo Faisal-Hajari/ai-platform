@@ -90,6 +90,14 @@ rather than trusting the file: `driver.enabled` false, `toolkit.enabled` true,
 a second kernel module, no containerd configuration at all, or a twenty-minute wait for a
 resource nothing will publish.
 
+Worth knowing before reading `/etc/containerd/conf.d/99-nvidia.toml` on the node: that
+drop-in is not four keys about the nvidia runtime. It is a snapshot of the **entire** CRI
+plugin section as the toolkit container resolved it — `cdi_spec_dirs`, `enable_cdi`, the CNI
+block, every default beside the runtimes — and an import overrides. So a containerd upgrade
+that moves any of those defaults is silently held to the values frozen when the toolkit last
+ran. Re-running the play re-runs the toolkit DaemonSet, which is the fix; it is a reason to
+re-run after a containerd bump rather than to assume nothing changed.
+
 **The Operator writes node state that no Ansible task and no `git grep` can find.** Its
 toolkit DaemonSet unpacks into `/usr/local/nvidia` and writes a containerd drop-in from
 inside a container. It reverts both on a graceful `SIGTERM` — the installer traps it and
