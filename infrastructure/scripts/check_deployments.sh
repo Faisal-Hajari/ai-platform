@@ -102,13 +102,25 @@ done
 # the cluster is dead. It does not self-heal: LB-IPAM will not evict a holder to make
 # room, so the condition just persists. Both halves are static YAML, so assert
 # containment here instead of learning it from the cluster (#26).
+#
+# The pool also has to be announced, and that is a second invariant with a worse failure
+# than the first: without a CiliumL2AnnouncementPolicy covering LoadBalancer addresses,
+# LB-IPAM still allocates, the Service still shows an EXTERNAL-IP and
+# IPAMRequestSatisfied stays true -- nothing in the cluster reports anything wrong, and
+# the address is simply unreachable from the LAN (#39). Delete l2-policy.yaml and every
+# check above still passes, so its existence is asserted below.
+#
+# Only the half of that the files can answer is asked here. Which interface a policy
+# matches, and whether the pool sits on that interface's subnet, are properties of the
+# machine: the subnet is a DHCP lease and appears nowhere in git. That half is asserted
+# by infrastructure/k8s-ansible/playbook.yml, against the host, before it touches it.
 echo "==> $cilium_dir/config"
 if pool_errors=$(CILIUM_DIR="$cilium_dir" INGRESS_RENDER="$ingress_render" python3 - 2>&1 <<'PY'
 import ipaddress, os, pathlib, sys, yaml
 
 chart = pathlib.Path(os.environ["CILIUM_DIR"])
 values = chart / "values.yaml"
-pool_dir = chart / "config"
+config_dir = chart / "config"
 render = pathlib.Path(os.environ["INGRESS_RENDER"])
 
 errors = []
@@ -143,39 +155,72 @@ def parse_block(name, block, allow_first_last):
 
 # *.y*ml, not *.yaml: ArgoCD's directory sync applies both spellings, and reading only
 # half the pools would let a pin look homeless when it is not, or vice versa.
-for path in sorted(pool_dir.glob("*.y*ml")):
+#
+# Read once and scanned twice below, rather than globbed once per kind: the two
+# passes would otherwise each need their own copy of this read-error handling, and a
+# manifest that parsed for one and not the other is not a state worth having.
+config_docs = []
+for path in sorted(config_dir.glob("*.y*ml")):
     try:
-        docs = list(yaml.safe_load_all(path.read_text()))
+        config_docs += [(path, d) for d in yaml.safe_load_all(path.read_text())
+                        if isinstance(d, dict)]
     except (OSError, yaml.YAMLError) as exc:
         errors.append(f"{path} could not be read: {exc}")
+
+for path, doc in config_docs:
+    if doc.get("kind") != "CiliumLoadBalancerIPPool":
         continue
-    for doc in docs:
-        if not isinstance(doc, dict) or doc.get("kind") != "CiliumLoadBalancerIPPool":
-            continue
-        name = (doc.get("metadata") or {}).get("name") or path.name
-        spec = doc.get("spec") or {}
-        # A pool that cannot hand this service an address is not containment, however
-        # well its blocks cover the pin. spec.disabled takes the whole pool out of
-        # service; spec.serviceSelector narrows it to services it matches, and the
-        # ingress service's labels are the upstream chart's to set, not this repo's --
-        # so rather than guess at a match, refuse to count the pool and name it in the
-        # failure. Both directions stay closed: an unservable pool cannot satisfy the
-        # check, and an operator who meant it to serve the ingress is told why it did
-        # not count. An empty selector is Cilium's match-all, so it is not a narrowing.
-        if spec.get("disabled"):
-            skipped.append(f"{name} (disabled)")
-            continue
-        if spec.get("serviceSelector"):
-            skipped.append(f"{name} (serviceSelector, not evaluated)")
-            continue
-        # Quoted "No" arrives as a string, bare No as False -- the field is a string
-        # enum, but nothing stops the YAML from being written either way.
-        allow_first_last = str(spec.get("allowFirstLastIPs", "Yes")).lower() not in ("no", "false")
-        for index, block in enumerate(spec.get("blocks") or []):
-            try:
-                blocks.append(parse_block(name, block, allow_first_last))
-            except (KeyError, TypeError, ValueError) as exc:
-                errors.append(f"{name} block {index} is malformed ({exc}): {block!r}")
+    name = (doc.get("metadata") or {}).get("name") or path.name
+    spec = doc.get("spec") or {}
+    # A pool that cannot hand this service an address is not containment, however
+    # well its blocks cover the pin. spec.disabled takes the whole pool out of
+    # service; spec.serviceSelector narrows it to services it matches, and the
+    # ingress service's labels are the upstream chart's to set, not this repo's --
+    # so rather than guess at a match, refuse to count the pool and name it in the
+    # failure. Both directions stay closed: an unservable pool cannot satisfy the
+    # check, and an operator who meant it to serve the ingress is told why it did
+    # not count. An empty selector is Cilium's match-all, so it is not a narrowing.
+    if spec.get("disabled"):
+        skipped.append(f"{name} (disabled)")
+        continue
+    if spec.get("serviceSelector"):
+        skipped.append(f"{name} (serviceSelector, not evaluated)")
+        continue
+    # Quoted "No" arrives as a string, bare No as False -- the field is a string
+    # enum, but nothing stops the YAML from being written either way.
+    allow_first_last = str(spec.get("allowFirstLastIPs", "Yes")).lower() not in ("no", "false")
+    for index, block in enumerate(spec.get("blocks") or []):
+        try:
+            blocks.append(parse_block(name, block, allow_first_last))
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{name} block {index} is malformed ({exc}): {block!r}")
+
+# What announces those addresses. loadBalancerIPs is the field that matters: a policy
+# with externalIPs alone covers Service.spec.externalIPs, which nothing in this repo
+# sets, and covers nothing LB-IPAM hands out -- so it is not an announcer for the pool
+# however well-formed it is.
+#
+# spec.interfaces is not read here. It is a list of regular expressions matched against
+# interface names, and absent or empty means every interface, so there is no value it
+# could hold that this could call wrong without knowing the host's NICs. Nor is
+# nodeSelector or serviceSelector: both decide whether a policy announces, not where,
+# and guessing at label matches against a Service whose labels the upstream chart sets
+# is how a check starts failing on correct configuration.
+announcers = [(doc.get("metadata") or {}).get("name") or path.name
+              for path, doc in config_docs
+              if doc.get("kind") == "CiliumL2AnnouncementPolicy"
+              and (doc.get("spec") or {}).get("loadBalancerIPs")]
+if not announcers:
+    policies = [(doc.get("metadata") or {}).get("name") or path.name
+                for path, doc in config_docs
+                if doc.get("kind") == "CiliumL2AnnouncementPolicy"]
+    detail = (f" -- the policies there ({', '.join(policies)}) do not set it"
+              if policies else "")
+    errors.append("no CiliumL2AnnouncementPolicy under"
+                  f" {config_dir} sets loadBalancerIPs: true{detail}. The pool"
+                  " above still allocates and cilium-ingress still gets an EXTERNAL-IP,"
+                  " so the cluster reports nothing wrong; the address simply answers no"
+                  " ARP and nothing on the LAN can reach any Ingress")
 
 # The pin comes out of the render rather than out of values.yaml, because a pin is only
 # real if the Service carrying it is emitted at all: with ingressController.enabled
@@ -211,7 +256,7 @@ else:
 
 if not blocks:
     detail = f" (skipped {', '.join(skipped)})" if skipped else ""
-    errors.append(f"no usable CiliumLoadBalancerIPPool block found under {pool_dir}{detail}")
+    errors.append(f"no usable CiliumLoadBalancerIPPool block found under {config_dir}{detail}")
 
 for text in str(pin or "").split(","):
     text = text.strip()

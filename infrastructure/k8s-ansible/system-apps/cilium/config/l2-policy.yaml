@@ -1,9 +1,39 @@
+# What makes the addresses in config/ip-pool.yaml reachable. LB-IPAM hands a pool address
+# to a Service and stops there; this is the only thing in the cluster that answers ARP for
+# it, so without this file every Ingress has an EXTERNAL-IP that nothing on the LAN can
+# reach.
+#
+# This file and config/ip-pool.yaml only work together while the pool sits on the subnet
+# the interface below is attached to -- 192.168.100.0/24 today. That subnet is the one
+# half of the pair that is not in git: it is a DHCP lease on the node, and neither
+# inventory.ini nor the playbook derives anything from the NIC. So the relationship is
+# asserted in two places rather than stated in one (#39):
+#
+#   - infrastructure/k8s-ansible/playbook.yml resolves the interfaces this policy matches
+#     on the host, and fails before it touches anything if the pool is not on one of their
+#     subnets. That is the half only the machine can answer.
+#   - infrastructure/scripts/check_deployments.sh asserts the half the files can answer --
+#     that a policy exists at all and that it announces LoadBalancer addresses -- and
+#     .github/workflows/check-deployments.yml runs it on every change here.
+#
+# Both exist because the cluster accepts every version of this being wrong in silence. A
+# policy naming an interface the host does not have applies cleanly; LB-IPAM still
+# allocates, IPAMRequestSatisfied stays true, and `kubectl get svc` looks exactly right
+# while the address is dead. That is the same shape as the pin-outside-the-pool failure in
+# #26, except that failure at least sets a condition on the Service.
 apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
 metadata:
   name: local-l2-policy
 spec:
+  # Regular expressions, matched unanchored against every interface name -- "eno1" would
+  # also match a NIC called "veno10" -- and an empty list means all of them. Named rather
+  # than left empty so the announcement stays on the LAN NIC the pool is addressed on
+  # instead of also going out on cilium_host and the container veths.
   interfaces:
     - eno1
+  # loadBalancerIPs is the field that matters to the pool: externalIPs covers
+  # Service.spec.externalIPs, which nothing in this repo sets. Setting only the latter
+  # leaves a policy that reads as if it announces and announces nothing.
   externalIPs: true
   loadBalancerIPs: true

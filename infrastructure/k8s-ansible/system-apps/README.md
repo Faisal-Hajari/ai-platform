@@ -60,6 +60,16 @@ sit inside the pool declared in `config/ip-pool.yaml`; as two separately-synced
 Applications with no ordering between them, that pair could disagree transiently even
 when both files were individually correct.
 
+The pool has a second constraint that is not in this repo at all: `config/l2-policy.yaml`
+announces those addresses over ARP on one named interface, and they only reach the LAN
+while the pool sits on the subnet that interface is attached to. That subnet is a DHCP
+lease on the node and nothing in git states it, so the two halves are checked in two
+places — `../../scripts/check_deployments.sh` asserts that a policy exists and announces
+LoadBalancer addresses, and `../playbook.yml` resolves the interfaces the policy matches
+on the host and refuses to build anything if the pool is off their subnets. Both matter
+because the cluster reports none of it: LB-IPAM allocates, the Service gets an
+`EXTERNAL-IP`, and the address is unreachable.
+
 The order the play uses is load-bearing and worth knowing before editing it:
 
 1. `helm upgrade --install`, **without `--wait`**. Helm counts a LoadBalancer Service as
