@@ -1,25 +1,44 @@
 # system-apps
 
-What ArgoCD needs in order to run. The Ansible play in `../playbook.yml` deploys
+What ArgoCD cannot safely reconcile. The Ansible play in `../playbook.yml` deploys
 everything here; ArgoCD deploys everything in `deployment/`. That is the whole boundary,
 and it is a directory rather than a per-Application exception so that nothing has to
 remember it.
 
 ## The membership rule
 
-**`system-apps/` holds only what ArgoCD needs in order to run.** That set has exactly two
-members: the CNI, and ArgoCD itself.
+**`system-apps/` holds two kinds of thing, and nothing else:**
+
+1. **What ArgoCD needs in order to run** — the CNI, and ArgoCD itself.
+2. **What writes the node's container runtime configuration** — today, the GPU Operator.
 
 cert-manager, metrics-server, monitoring, and anything else that merely feels "systemy"
 does not qualify and belongs in `deployment/`. The test is not importance and not blast
-radius — it is whether ArgoCD could reconcile the thing at all. Without a CNI no pod
-reaches the API server, so ArgoCD cannot be the thing that installs one; ArgoCD cannot
-bootstrap itself either. Everything else can be reconciled, and should be.
+radius.
+
+For clause 1 the test is whether ArgoCD could reconcile the thing at all. Without a CNI no
+pod reaches the API server, so ArgoCD cannot be the thing that installs one; ArgoCD cannot
+bootstrap itself either.
+
+For clause 2 the test is narrower than it looks: does it rewrite `/etc/containerd` and
+restart containerd? The generator's template applies `prune: true` and `selfHeal: true`,
+so anything under `deployment/` is reconciled by a controller running on the runtime it is
+editing — which is the same objection that moved the CNI out, one layer down. The GPU
+Operator's toolkit DaemonSet does exactly that, so it is here.
+
+**Clause 2 was added, not assumed, and it is the honest cost of choosing the GPU
+Operator.** The bar this README used to state — argue that ArgoCD cannot start without it
+— is one the Operator cannot clear: ArgoCD reconciles perfectly well on a cluster with no
+GPU. A bare device plugin in `deployment/` would have satisfied the old rule and needed no
+widening, at the price of hand-rolling the container toolkit and the containerd runtime
+handler in Ansible. Running the stack NVIDIA actually supports was judged worth one more
+clause. Widening it *silently* would not have been.
 
 This is written down because the alternative is folklore. Without a stated criterion this
 directory becomes the place things go when GitOps feels risky, and workloads that should
-have a reconciler quietly lose one. Adding a third member means arguing that ArgoCD
-cannot start without it — not that it would be inconvenient if it broke.
+have a reconciler quietly lose one. A fourth member means arguing it fits one of the two
+clauses above — not that it would be inconvenient if it broke, and not that it is easier
+to reason about here.
 
 ## Why the boundary is a directory
 
@@ -43,11 +62,59 @@ system-apps/
       ip-pool.yaml    two CiliumLoadBalancerIPPools: the ingress reservation, and
                       the general range
       l2-policy.yaml  CiliumL2AnnouncementPolicy
+  gpu-operator/
+    Chart.yaml        umbrella over NVIDIA's gpu-operator chart, version pinned
+    values.yaml       three overrides and the reasoning for every default left alone
   argocd/
     Chart.yaml        umbrella over the upstream argo-cd chart, version pinned
     values.yaml       ArgoCD's own configuration
     applicationset.yaml
 ```
+
+**The GPU Operator owns the whole GPU stack above the driver.** It installs the NVIDIA
+container toolkit onto the node, writes containerd's `nvidia` runtime handler, creates the
+`RuntimeClass` that selects it, and runs the device plugin that publishes `nvidia.com/gpu`
+into the node's allocatable resources — plus DCGM metrics and node feature discovery. The
+play configures none of that itself, deliberately: `toolkit.enabled` is on, so there is one
+writer of the runtime handler, the same single-renderer rule Cilium is held to.
+
+The driver is the exception, and it is the host's. `driver.enabled` is off, because the
+Operator's driver component builds a kernel module in a container and this machine already
+has a driver in that slot. The play asserts `nvidia-smi -L` lists a card before it touches
+anything, so a driverless host fails in the first seconds rather than twenty minutes into
+an image pull.
+
+Three values in `gpu-operator/values.yaml` are load-bearing enough that
+`../../scripts/check_deployments.sh` asserts them against the rendered `ClusterPolicy`
+rather than trusting the file: `driver.enabled` false, `toolkit.enabled` true,
+`devicePlugin.enabled` true. Each of the three fails late and confusingly if it flips —
+a second kernel module, no containerd configuration at all, or a twenty-minute wait for a
+resource nothing will publish.
+
+Worth knowing before reading `/etc/containerd/conf.d/99-nvidia.toml` on the node: that
+drop-in is not four keys about the nvidia runtime. It is a snapshot of the **entire** CRI
+plugin section as the toolkit container resolved it — `cdi_spec_dirs`, `enable_cdi`, the CNI
+block, every default beside the runtimes — and an import overrides. So a containerd upgrade
+that moves any of those defaults is silently held to the values frozen when the toolkit last
+ran. Re-running the play re-runs the toolkit DaemonSet, which is the fix; it is a reason to
+re-run after a containerd bump rather than to assume nothing changed.
+
+**The Operator writes node state that no Ansible task and no `git grep` can find.** Its
+toolkit DaemonSet unpacks into `/usr/local/nvidia` and writes a containerd drop-in from
+inside a container. It reverts both on a graceful `SIGTERM` — the installer traps it and
+unconfigures containerd on the way out — but `kubeadm reset` never delivers one, so
+`../../scripts/destroy_cluster.sh` removes those paths by hand and asserts they are gone.
+
+That is observed rather than assumed. A teardown of this cluster logs a `StopPodSandbox
+... DeadlineExceeded` for *every* sandbox on the node and ends on `[reset] Failed to
+remove containers`, because `kubeadm reset` drives the CRI while the CNI agent is
+already gone. Nothing on the node is stopped cleanly, the toolkit DaemonSet included —
+so its own revert path never runs, and the hand-rolled cleanup is doing real work rather
+than duplicating it. The stall is not GPU-specific and predates this chart, but it
+scales with pod count and the Operator roughly doubles that.
+
+That is the concrete price of clause 2, and it is the thing most likely to rot: if a future
+Operator version changes where it installs, that script is what has to follow.
 
 **Cilium is rendered once.** `helm upgrade --install` against `cilium/`, from
 `cilium/values.yaml`, and nothing else. It used to be rendered twice — the Cilium CLI at

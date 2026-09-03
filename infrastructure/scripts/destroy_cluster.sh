@@ -35,14 +35,33 @@
 #                    kubelet behind it; the drop-ins go, chrony stays.
 #   docker           never installed by this repo. See the containerd step below -- that
 #                    one is shared, and is skipped rather than forced when it is.
+#   the NVIDIA       never installed by this repo -- the playbook asserts a driver is
+#   driver           present and refuses to run without one, and the GPU Operator's own
+#                    driver component is disabled for that reason. Installing one means
+#                    owning kernel modules and reboots. A destroyed machine still has a
+#                    working `nvidia-smi`.
 #   the checkout     git tracks it; only the gitignored chart cache inside it is cleared.
 #
 # WARNING for anyone editing playbook.yml: the host-tuning half of this script is a
 # hand-maintained mirror of what that play writes outside /etc/kubernetes -- the sysctl
 # file, the modules-load file, the systemd drop-ins, the fstab edit, the apt source and the
 # binaries in /usr/local/bin are all restated here as literals, and nothing keeps the two
-# in step. The verification block at the end is the closest thing to a guard: it asserts
-# the machine is actually clean rather than trusting that these steps covered everything.
+# in step.
+#
+# The GPU stack widens that warning in a way worth stating separately, because it is the
+# one part of this machine's configuration the play does not write itself. The GPU
+# Operator's toolkit DaemonSet unpacks a toolkit into /usr/local/nvidia and writes a
+# containerd drop-in, from *inside a container*, so those paths appear in no Ansible task
+# and no `git grep`.
+#
+# The Operator does revert them: its installer traps SIGTERM and unconfigures containerd on
+# the way out. But that needs a graceful pod shutdown, and `kubeadm reset` below is not one.
+# The reset log says so directly -- every sandbox on the node fails to stop, and the run
+# ends on `[reset] Failed to remove containers` -- so nothing here reverts itself, and this
+# script removes those paths by hand.
+#
+# The verification block at the end is the closest thing to a guard: it asserts the machine
+# is actually clean rather than trusting that these steps covered everything.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -119,7 +138,9 @@ if [ "$ASSUME_YES" -eq 0 ]; then
     printf 'This will DESTROY the cluster on %s and clear all node-local state.\n' "$(hostname)"
   else
     printf 'This will DESTROY the cluster on %s and REMOVE kubeadm/kubelet/kubectl,\n' "$(hostname)"
-    printf 'containerd, Helm, crictl and the host tuning that goes with them.\n'
+    printf 'containerd, Helm, crictl, the NVIDIA container toolkit the GPU Operator\n'
+    printf 'installed, and the host tuning that goes with them. The GPU driver itself\n'
+    printf 'is left alone.\n'
   fi
   printf 'Everything in etcd goes with it, and there is no backup step here.\n'
   printf 'Type the hostname (%s) to continue: ' "$(hostname)"
@@ -202,6 +223,70 @@ sudo rm -rf --one-file-system /var/run/cilium /var/lib/cilium
 sudo find /sys/fs/bpf/tc/globals -maxdepth 1 -name 'cilium_*' -exec rm -rf {} + 2>/dev/null || true
 sudo rm -rf /sys/fs/bpf/cilium
 info "cilium state, links and pinned BPF maps cleared"
+
+step "GPU Operator node state"
+# Written by the Operator's toolkit DaemonSet from inside a container, not by any task in
+# playbook.yml -- see the header. The DaemonSet reverts all of it on a graceful SIGTERM,
+# which a `kubeadm reset` never delivers, so on this path it survives.
+#
+# Cleared even under --keep-packages, unlike the packages themselves: a rebuild re-runs the
+# Operator, and it is the *toolkit version* pinned into these files that would be stale. A
+# drop-in from a previous Operator naming a BinaryName under an install dir the new one has
+# replaced is the GPU equivalent of the stale Cilium BPF maps below -- containerd loads it
+# happily and every GPU pod fails at container start.
+#
+# The drop-in glob is deliberately wider than one filename: the Operator picks the drop-in
+# path itself and has changed it between versions, so match what it writes rather than one
+# literal. find, not a shell glob -- an unmatched glob is fatal under zsh, which would skip
+# this cleanup on exactly the runs where the directory is already clean.
+if [ -d /etc/containerd/conf.d ]; then
+  sudo find /etc/containerd/conf.d -maxdepth 1 -name '*nvidia*.toml' -delete 2>/dev/null || true
+  # Only if this emptied it. rmdir refuses a directory still holding somebody else's
+  # drop-in, which is the outcome to want.
+  sudo rmdir /etc/containerd/conf.d 2>/dev/null || true
+  info "cleared NVIDIA containerd drop-ins"
+fi
+
+# The CDI specs the device plugin generates, which is how a GPU actually reaches a pod here:
+# containerd 2.x has CDI on by default and the plugin runs with
+# DEVICE_LIST_STRATEGY=cdi-annotations,cdi-cri, so the runtime handler is never on the path
+# for an ordinary GPU workload -- the spec in /var/run/cdi is. It names device nodes and the
+# hook under /usr/local/nvidia that the step below deletes, so leaving it behind leaves a
+# spec pointing at a hook that is gone. (/var/run is a symlink to /run, and containerd's
+# own `cdi_spec_dirs` spells it /var/run/cdi, so this matches the config rather than the
+# shorter path the prose elsewhere uses.)
+#
+# /run is a tmpfs and so this self-clears on reboot, and a rebuild regenerates the spec
+# regardless. It goes anyway: a teardown that has to be followed by a reboot to be complete
+# is not the claim this script makes.
+#
+# A glob rather than filenames, and that is load-bearing rather than defensive: the live
+# directory holds `k8s.device-plugin.nvidia.com-gpu.json` AND
+# `management.nvidia.com-gpu.yaml` -- two names, two components, even two file extensions.
+# Any literal would have missed one.
+# Still scoped to *nvidia* rather than clearing the directory, because CDI is a general
+# mechanism and another vendor's spec is not ours to delete.
+for cdi_dir in /var/run/cdi /etc/cdi; do
+  [ -d "$cdi_dir" ] || continue
+  sudo find "$cdi_dir" -maxdepth 1 -name '*nvidia*' -delete 2>/dev/null || true
+done
+info "cleared NVIDIA CDI specs"
+
+# /run/nvidia is a tmpfs-backed runtime directory that also carries the driver-root bind
+# mount the Operator sets up; /usr/local/nvidia is the toolkit install dir (toolkit.installDir
+# in system-apps/gpu-operator/values.yaml). Neither belongs to the host driver, which lives
+# under /usr/lib and /usr/bin and is not touched here.
+for d in /run/nvidia /usr/local/nvidia; do
+  if [ -e "$d" ]; then
+    sudo umount "$d" 2>/dev/null || true
+    sudo rm -rf --one-file-system "$d" || true
+    if [ -e "$d" ]; then
+      warn "$d could not be fully removed -- something under it is still mounted or in use"
+    else
+      info "removed $d"
+    fi
+  fi
+done
 
 step "Kubernetes state directories"
 # kubelet leaves a tmpfs mount under /var/lib/kubelet/pods for every secret and projected
@@ -576,6 +661,7 @@ paths=(/etc/kubernetes /var/lib/etcd /var/lib/kubelet /etc/cni/net.d /opt/cni
        /etc/apt/keyrings/kubernetes-apt-keyring.gpg
        /etc/systemd/system/kubelet.service.d/10-time-sync.conf
        /etc/systemd/system/containerd.service.d/10-time-sync.conf
+       /run/nvidia /usr/local/nvidia
        "$TARGET_HOME/.kube")
 if [ "$containerd_kept" -eq 0 ]; then
   binaries+=(containerd)
