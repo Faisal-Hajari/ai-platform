@@ -179,12 +179,12 @@ resources:
 ```
 
 No `runtimeClassName`, and no change to how anything else on the node runs. The Operator
-leaves `default_runtime_name = "runc"`, so non-GPU pods are untouched; the device plugin runs
-with `DEVICE_LIST_STRATEGY=cdi-annotations,cdi-cri` and containerd 2.x has CDI enabled by
-default, so the card is injected through a CDI spec in `/run/cdi` rather than through the
-runtime handler. The `nvidia`, `nvidia-cdi` and `nvidia-legacy` RuntimeClasses the Operator
-creates are there for workloads that want to select a handler explicitly; nothing here has
-to.
+leaves `default_runtime_name = "runc"`, so non-GPU pods are untouched; the device plugin
+runs with `DEVICE_LIST_STRATEGY=cdi-annotations,cdi-cri` and containerd 2.x has CDI
+enabled by default, so the card is injected through a CDI spec in `/var/run/cdi` rather
+than through the runtime handler. The `nvidia`, `nvidia-cdi` and `nvidia-legacy`
+RuntimeClasses the Operator creates are there for workloads that want to select a
+handler explicitly; nothing here has to.
 
 **The end state is asserted, not hoped for.** The play waits for the node to actually
 advertise `nvidia.com/gpu` before it moves on, up to twenty minutes on a first bootstrap

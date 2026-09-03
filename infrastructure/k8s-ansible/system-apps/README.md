@@ -103,6 +103,15 @@ toolkit DaemonSet unpacks into `/usr/local/nvidia` and writes a containerd drop-
 inside a container. It reverts both on a graceful `SIGTERM` — the installer traps it and
 unconfigures containerd on the way out — but `kubeadm reset` never delivers one, so
 `../../scripts/destroy_cluster.sh` removes those paths by hand and asserts they are gone.
+
+That is observed rather than assumed. A teardown of this cluster logs a `StopPodSandbox
+... DeadlineExceeded` for *every* sandbox on the node and ends on `[reset] Failed to
+remove containers`, because `kubeadm reset` drives the CRI while the CNI agent is
+already gone. Nothing on the node is stopped cleanly, the toolkit DaemonSet included —
+so its own revert path never runs, and the hand-rolled cleanup is doing real work rather
+than duplicating it. The stall is not GPU-specific and predates this chart, but it
+scales with pod count and the Operator roughly doubles that.
+
 That is the concrete price of clause 2, and it is the thing most likely to rot: if a future
 Operator version changes where it installs, that script is what has to follow.
 

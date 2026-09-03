@@ -52,11 +52,16 @@
 # one part of this machine's configuration the play does not write itself. The GPU
 # Operator's toolkit DaemonSet unpacks a toolkit into /usr/local/nvidia and writes a
 # containerd drop-in, from *inside a container*, so those paths appear in no Ansible task
-# and no `git grep`. The Operator does revert them -- its installer traps SIGTERM and
-# unconfigures containerd on the way out -- but only on a graceful pod shutdown, and
-# `kubeadm reset` below is not that. So this script removes them by hand, and the
-# verification block asserts they are gone. The verification block at the end is the closest thing to a guard: it asserts
-# the machine is actually clean rather than trusting that these steps covered everything.
+# and no `git grep`.
+#
+# The Operator does revert them: its installer traps SIGTERM and unconfigures containerd on
+# the way out. But that needs a graceful pod shutdown, and `kubeadm reset` below is not one.
+# The reset log says so directly -- every sandbox on the node fails to stop, and the run
+# ends on `[reset] Failed to remove containers` -- so nothing here reverts itself, and this
+# script removes those paths by hand.
+#
+# The verification block at the end is the closest thing to a guard: it asserts the machine
+# is actually clean rather than trusting that these steps covered everything.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -245,15 +250,22 @@ fi
 # The CDI specs the device plugin generates, which is how a GPU actually reaches a pod here:
 # containerd 2.x has CDI on by default and the plugin runs with
 # DEVICE_LIST_STRATEGY=cdi-annotations,cdi-cri, so the runtime handler is never on the path
-# for an ordinary GPU workload -- the spec in /run/cdi is. It names device nodes and the
+# for an ordinary GPU workload -- the spec in /var/run/cdi is. It names device nodes and the
 # hook under /usr/local/nvidia that the step below deletes, so leaving it behind leaves a
-# spec pointing at a hook that is gone.
+# spec pointing at a hook that is gone. (/var/run is a symlink to /run, and containerd's
+# own `cdi_spec_dirs` spells it /var/run/cdi, so this matches the config rather than the
+# shorter path the prose elsewhere uses.)
 #
 # /run is a tmpfs and so this self-clears on reboot, and a rebuild regenerates the spec
 # regardless. It goes anyway: a teardown that has to be followed by a reboot to be complete
-# is not the claim this script makes. Matched on the nvidia-specific filenames rather than
-# clearing the directory, because CDI is a general mechanism and another vendor's spec is
-# not ours to delete.
+# is not the claim this script makes.
+#
+# A glob rather than filenames, and that is load-bearing rather than defensive: the live
+# directory holds `k8s.device-plugin.nvidia.com-gpu.json` AND
+# `management.nvidia.com-gpu.yaml` -- two names, two components, even two file extensions.
+# Any literal would have missed one.
+# Still scoped to *nvidia* rather than clearing the directory, because CDI is a general
+# mechanism and another vendor's spec is not ours to delete.
 for cdi_dir in /var/run/cdi /etc/cdi; do
   [ -d "$cdi_dir" ] || continue
   sudo find "$cdi_dir" -maxdepth 1 -name '*nvidia*' -delete 2>/dev/null || true
